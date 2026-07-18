@@ -1,6 +1,6 @@
 --[[
 ================================================================================
-VLSub OpenSubtitles.com Extension for VLC Media Player 3.0+
+VLSub OpenSubtitles.com + SubSource Extension for VLC Media Player 3.0+
 ================================================================================
 
 DESCRIPTION:
@@ -177,6 +177,7 @@ local options = {
   language = nil,
   language2 = nil,  -- Second language
   language3 = nil,  -- Third language
+  subsource_api_key = nil, -- SubSource API key
   sortBy = nil,     -- API order_by
   sortDirection = "desc", -- API order_direction
   downloadBehaviour = 'save',
@@ -214,6 +215,7 @@ local options = {
     int_help = 'Help',
     int_search_hash = 'Search by hash',
     int_search_name = 'Search',
+    int_search_subsource = 'Search (SubSource)',
     int_title = 'Title',
     int_season = 'TV Season',
     int_episode = 'TV Episode',
@@ -243,6 +245,7 @@ local options = {
     int_vlsub_work_dir = 'VLSub working directory',
     int_os_username = 'OpenSubtitles.com Username',
     int_os_password = 'OpenSubtitles.com Password',
+    int_subsource_api_key = 'SubSource API Key (Optional)',
     int_help_mess =[[
       Download subtitles from
       <a href='http://www.opensubtitles.org/'>
@@ -1157,13 +1160,13 @@ function process_release_notes(notes)
 
   -- Split into individual features and clean up
   local features = {}
-  for line in processed:gmatch("[^\n]+") do
-    line = string.gsub(line, "^%s*", "") -- Remove leading spaces
-    line = string.gsub(line, "%s*$", "") -- Remove trailing spaces
+  for raw_line in processed:gmatch("[^\n]+") do
+    local clean_line = string.gsub(raw_line, "^%s*", "") -- Remove leading spaces
+    clean_line = string.gsub(clean_line, "%s*$", "") -- Remove trailing spaces
 
     -- Skip empty lines and section headers
-    if line ~= "" and not string.match(line, "^[A-Z][a-z]+%s*$") then
-      table.insert(features, line)
+    if clean_line ~= "" and not string.match(clean_line, "^[A-Z][a-z]+%s*$") then
+      table.insert(features, clean_line)
     end
   end
 
@@ -1727,8 +1730,609 @@ function meta_changed()
 end
 
 
-            --[[ Interface data ]]--
+-- SubSource API Integration Engine
+-- SubSource API Integration Engine
+subSource = {}
+subSource.base_url = "https://api.subsource.net/api/v1"
 
+function subSource.validateKey(api_key)
+  if not api_key or trim(api_key) == "" then
+    return false, "SubSource API Key is empty"
+  end
+
+  -- api_key in query string is the only auth method that works reliably with vlc.stream
+  -- (vlc.stream converts headers to URL params, which SubSource rejects)
+  local test_url = build_sorted_url(subSource.base_url .. "/movies/search", { searchType = "text", q = "test", api_key = trim(api_key) })
+  local client = Curl.new()
+  client:set_timeout(10)
+  client:set_retries(1)
+
+  local res = client:get(test_url)
+  if not res then
+    return false, "SubSource server did not respond"
+  end
+
+  if res.status == 200 then
+    return true, "SubSource API Key validated successfully!"
+  elseif res.status == 401 or res.status == 403 then
+    return false, "Invalid SubSource API Key (HTTP " .. tostring(res.status) .. ")"
+  else
+    return false, "SubSource API returned status " .. tostring(res.status)
+  end
+end
+
+function subSource.convertResponse(parsed_data, default_title)
+  local results = {}
+  local raw_items = {}
+
+  if type(parsed_data) == "table" then
+    if parsed_data.data and type(parsed_data.data) == "table" then
+      raw_items = parsed_data.data
+    elseif #parsed_data > 0 then
+      raw_items = parsed_data
+    elseif parsed_data.subtitles and type(parsed_data.subtitles) == "table" then
+      raw_items = parsed_data.subtitles
+    end
+  end
+
+  -- Language name to ISO code mapping lookup
+  local lang_name_map = {
+    english = "en", eng = "en",
+    romanian = "ro", rum = "ro",
+    french = "fr", fre = "fr", fra = "fr",
+    spanish = "es", spa = "es",
+    german = "de", ger = "de", deu = "de",
+    italian = "it", ita = "it",
+    portuguese = "pt", por = "pt", pob = "pt-br",
+    russian = "ru", rus = "ru",
+    dutch = "nl", dut = "nl", nld = "nl",
+    polish = "pl", pol = "pl",
+    turkish = "tr", tur = "tr",
+    arabic = "ar", ara = "ar",
+    greek = "el", ell = "el", gre = "el",
+    czech = "cs", cze = "cs", ces = "cs",
+    hungarian = "hu", hun = "hu",
+    swedish = "sv", swe = "sv",
+    danish = "da", dan = "da",
+    finnish = "fi", fin = "fi",
+    norwegian = "no", nor = "no",
+    hebrew = "he", heb = "he",
+    japanese = "ja", jpn = "ja",
+    korean = "ko", kor = "ko",
+    chinese = "zh", chi = "zh", zho = "zh"
+  }
+
+  for _, item in ipairs(raw_items) do
+    local sub_id = item.subtitleId or item.id or item.sub_id or item.subtitle_id
+    if sub_id then
+      -- Build release name string from releaseInfo array, commentary, or fallback
+      local sub_name = nil
+      if item.releaseInfo and type(item.releaseInfo) == "table" and #item.releaseInfo > 0 then
+        local title_prefix = (default_title and default_title ~= "") and (default_title .. ".") or ""
+        sub_name = title_prefix .. table.concat(item.releaseInfo, ".") .. ".srt"
+      elseif item.full_name or item.release_name or item.filename or item.name then
+        sub_name = item.full_name or item.release_name or item.filename or item.name
+      elseif item.commentary and item.commentary ~= "" then
+        sub_name = (default_title or "subtitle") .. " (" .. item.commentary .. ").srt"
+      else
+        sub_name = (default_title or "subtitle") .. ".srt"
+      end
+
+      -- Map language name/code
+      local raw_lang = string.lower(tostring(item.language or item.lang or item.language_code or "en"))
+      local lang_code = lang_name_map[raw_lang] or (string.len(raw_lang) <= 3 and raw_lang or string.sub(raw_lang, 1, 2))
+
+      -- Detect HD quality from releaseInfo, releaseType, or productionType
+      local is_hd = false
+      if item.hd ~= nil then
+        is_hd = item.hd
+      else
+        local combined_info = ""
+        if item.releaseInfo and type(item.releaseInfo) == "table" then
+          combined_info = table.concat(item.releaseInfo, " ")
+        end
+        if item.productionType then combined_info = combined_info .. " " .. tostring(item.productionType) end
+        if item.releaseType then combined_info = combined_info .. " " .. tostring(item.releaseType) end
+        combined_info = string.lower(combined_info)
+        if string.find(combined_info, "1080p") or string.find(combined_info, "720p") or string.find(combined_info, "4k") or string.find(combined_info, "2160p") or string.find(combined_info, "bluray") then
+          is_hd = true
+        end
+      end
+
+      -- Extract hearing impaired flag (supports camelCase hearingImpaired and snake_case hearing_impaired)
+      local is_hi = false
+      if item.hearingImpaired ~= nil then
+        is_hi = item.hearingImpaired
+      elseif item.hearing_impaired ~= nil then
+        is_hi = item.hearing_impaired
+      end
+
+      -- Extract uploader name from contributors array or uploaderId
+      local uploader = "SubSource"
+      if item.contributors and type(item.contributors) == "table" and #item.contributors > 0 then
+        local contrib = item.contributors[1]
+        if type(contrib) == "table" and contrib.displayname then
+          uploader = contrib.displayname
+        end
+      elseif item.uploader and type(item.uploader) == "table" and item.uploader.name then
+        uploader = item.uploader.name
+      elseif item.uploaderId then
+        uploader = "User #" .. tostring(item.uploaderId)
+      end
+
+      -- Extract upload date (createdAt, upload_date, created_at)
+      local upload_date = item.createdAt or item.upload_date or item.created_at or ""
+      local dl_cnt = item.downloads or item.download_count or 0
+
+      table.insert(results, {
+        Provider = "SubSource",
+        SubtitleID = tostring(sub_id),
+        FileID = tostring(sub_id),
+        SubFileName = sub_name,
+        SubLanguageID = lang_code,
+        SubDownloadsCnt = tostring(dl_cnt),
+        HearingImpaired = is_hi,
+        HD = is_hd,
+        FromTrusted = true,
+        UploaderName = uploader,
+        UploadDate = upload_date,
+        url = item.download_url or ("https://subsource.net/subtitles/" .. tostring(sub_id))
+      })
+    end
+  end
+
+  return results
+end
+
+function subSource.search(movie_title, languages_str, season, episode, imdb_id, year, is_hash)
+  local api_key = trim(openSub.option.subsource_api_key or "")
+  if api_key == "" then
+    vlc.msg.dbg("[SubSource] Search skipped - no API key provided")
+    return {}
+  end
+
+  vlc.msg.dbg("[SubSource] Searching subtitles for title: " .. tostring(movie_title))
+
+  -- Language mapping from code to full name for SubSource API
+  local lang_code_to_name = {
+    en = "english", eng = "english",
+    ro = "romanian", rum = "romanian",
+    fr = "french", fre = "french",
+    es = "spanish", spa = "spanish",
+    de = "german", ger = "german",
+    it = "italian", ita = "italian",
+    pt = "portuguese", por = "portuguese", pob = "portuguese",
+    ru = "russian", rus = "russian",
+    nl = "dutch", dut = "dutch",
+    pl = "polish", pol = "polish",
+    tr = "turkish", tur = "turkish",
+    ar = "arabic", ara = "arabic",
+    el = "greek", ell = "greek",
+    cs = "czech", cze = "czech",
+    hu = "hungarian", hun = "hungarian",
+    sv = "swedish", swe = "swedish",
+    da = "danish", dan = "danish",
+    fi = "finnish", fin = "finnish",
+    no = "norwegian", nor = "norwegian"
+  }
+
+  local full_lang_name = nil
+  if languages_str and languages_str ~= "" and languages_str ~= "all" then
+    local primary_lang = string.match(languages_str, "^([^,]+)") or languages_str
+    primary_lang = string.lower(primary_lang)
+    full_lang_name = lang_code_to_name[primary_lang] or primary_lang
+  end
+
+  local season_num = season and tonumber(season)
+  local episode_num = episode and tonumber(episode)
+
+  local client = Curl.new()
+  -- No headers: vlc.stream (HTTPS) converts them to URL params which SubSource rejects
+  client:set_timeout(25)
+  client:set_retries(2)
+
+  -- -----------------------------------------------------------------------
+  -- SubSource /subtitles requires movieId — releaseInfo alone returns empty.
+  -- The /movies/search response has a "season" field on each entry.
+  -- Strategy:
+  --   1. Get all movie entries for the title (paginate the movie search)
+  --   2. Find the entry whose entry.season matches the requested season
+  --   3. Fetch all subtitle pages for that movieId
+  --   4. Client-side filter for episode
+  -- -----------------------------------------------------------------------
+
+  -- Step 1: Collect all movie entries (SubSource may paginate movie results too)
+  local movie_entries = {}
+
+  local function fetch_movie_entries(query)
+    local url = build_sorted_url(subSource.base_url .. "/movies/search", {
+      searchType = "text", q = query, api_key = api_key
+    })
+    vlc.msg.dbg("[SubSource] Movie search: " .. url)
+    local r = client:get(url)
+    if r and r.status == 200 and r.body then
+      vlc.msg.dbg("[SubSource] Movie search response: " .. string.sub(r.body, 1, 800))
+      local ok, parsed = pcall(json.decode, r.body, 1, true)
+      if ok and parsed and parsed.data and type(parsed.data) == "table" then
+        for _, entry in ipairs(parsed.data) do
+          vlc.msg.dbg("[SubSource] Movie entry: id=" .. tostring(entry.movieId or entry.id) .. " season=" .. tostring(entry.season) .. " title=" .. tostring(entry.title))
+          table.insert(movie_entries, entry)
+        end
+      end
+    end
+  end
+
+  if imdb_id and imdb_id ~= "" then
+    local url = build_sorted_url(subSource.base_url .. "/movies/search", {
+      searchType = "imdb", imdb = imdb_id, api_key = api_key
+    })
+    local r = client:get(url)
+    if r and r.status == 200 and r.body then
+      local ok, parsed = pcall(json.decode, r.body, 1, true)
+      if ok and parsed and parsed.data and type(parsed.data) == "table" then
+        for _, entry in ipairs(parsed.data) do
+          vlc.msg.dbg("[SubSource] IMDb movie entry: id=" .. tostring(entry.movieId or entry.id) .. " season=" .. tostring(entry.season))
+          table.insert(movie_entries, entry)
+        end
+      end
+    end
+  end
+
+  if #movie_entries == 0 and movie_title and movie_title ~= "" then
+    fetch_movie_entries(movie_title)
+  end
+
+  if #movie_entries == 0 then
+    vlc.msg.dbg("[SubSource] No movie entries found for: " .. tostring(movie_title))
+    return {}
+  end
+
+  -- Step 2: Pick the best matching movieId(s)
+  -- Prefer entry whose entry.season matches season_num; collect all matches
+  local target_movie_ids = {}
+
+  if season_num and season_num > 0 then
+    -- Try exact season match first
+    for _, entry in ipairs(movie_entries) do
+      local entry_season = tonumber(entry.season)
+      if entry_season and entry_season == season_num then
+        local mid = entry.movieId or entry.id
+        if mid then
+          vlc.msg.dbg("[SubSource] Season-matched movieId: " .. tostring(mid) .. " (season=" .. tostring(entry_season) .. ")")
+          table.insert(target_movie_ids, tostring(mid))
+        end
+      end
+    end
+  end
+
+  -- Fall back to all entries if no season match
+  if #target_movie_ids == 0 then
+    vlc.msg.dbg("[SubSource] No season-specific match, using all " .. #movie_entries .. " entries")
+    for _, entry in ipairs(movie_entries) do
+      local mid = entry.movieId or entry.id
+      if mid then table.insert(target_movie_ids, tostring(mid)) end
+    end
+  end
+
+  -- Step 3: Fetch subtitles for all target movieIds
+  local function fetch_subtitles_for_movie(mid)
+    local all = {}
+    local page = 1
+    local max_pages = 5
+    repeat
+      local params = { movieId = mid, api_key = api_key, page = tostring(page) }
+      if full_lang_name then params["language"] = full_lang_name end
+      local url = build_sorted_url(subSource.base_url .. "/subtitles", params)
+      vlc.msg.dbg("[SubSource] subtitles movieId=" .. mid .. " page=" .. page .. ": " .. url)
+      local r = client:get(url)
+      if not r or r.status ~= 200 or not r.body then break end
+      local ok, parsed = pcall(json.decode, r.body, 1, true)
+      if not ok or not parsed then break end
+      local items = subSource.convertResponse(parsed, movie_title)
+      for _, v in ipairs(items) do table.insert(all, v) end
+      vlc.msg.dbg("[SubSource] movieId=" .. mid .. " page=" .. page .. " → " .. #items .. " items (total api: " .. tostring(parsed.pagination and parsed.pagination.total) .. ")")
+      local total_pages = parsed.pagination and parsed.pagination.pages or 1
+      if page >= total_pages or page >= max_pages then break end
+      page = page + 1
+    until false
+    return all
+  end
+
+  local all_converted = {}
+  for _, mid in ipairs(target_movie_ids) do
+    local subs = fetch_subtitles_for_movie(mid)
+    for _, v in ipairs(subs) do table.insert(all_converted, v) end
+  end
+
+  if #all_converted == 0 then
+    vlc.msg.dbg("[SubSource] No subtitles found")
+    return {}
+  end
+
+  -- Client-side season/episode filter
+  local converted = all_converted
+  if season_num and season_num > 0 then
+    local filtered = {}
+    local s_padded = string.format("%02d", season_num)
+    local e_padded = episode_num and episode_num > 0 and string.format("%02d", episode_num) or nil
+
+    for _, item in ipairs(all_converted) do
+      local fname = string.upper(item.SubFileName or "")
+      local matched = false
+
+      local has_season = string.find(fname, string.format("S%s", s_padded), 1, true) ~= nil
+                      or string.find(fname, string.format("%dX", season_num), 1, true) ~= nil
+
+      if has_season then
+        if e_padded then
+          local has_any_ep = string.find(fname, string.format("S%sE", s_padded), 1, true) ~= nil
+          if has_any_ep then
+            matched = string.find(fname, string.format("E%s", e_padded), 1, true) ~= nil
+                   or string.find(fname, string.format("E0*%d[^0-9]", episode_num)) ~= nil
+          else
+            matched = true  -- season pack covers all episodes
+          end
+        else
+          matched = true
+        end
+      end
+
+      if matched then table.insert(filtered, item) end
+    end
+    vlc.msg.dbg("[SubSource] After S" .. s_padded .. (e_padded and ("E"..e_padded) or "") .. " filter: " .. #filtered .. "/" .. #all_converted)
+    -- If episode filter removed everything, fall back to season-level results (season packs)
+    if #filtered == 0 and e_padded then
+      vlc.msg.dbg("[SubSource] Episode filter zeroed results, returning season-level matches")
+      for _, item in ipairs(all_converted) do
+        local fname = string.upper(item.SubFileName or "")
+        if string.find(fname, string.format("S%s", s_padded), 1, true) then
+          table.insert(filtered, item)
+        end
+      end
+    end
+    converted = filtered
+  end
+
+  vlc.msg.dbg("[SubSource] Search returned " .. #converted .. " subtitles")
+  return converted
+end
+
+-- Score an SRT filename against requested season/episode (higher = better match)
+local function score_srt_for_episode(fname, season_num, episode_num)
+  local upper = string.upper(fname)
+  local score = 0
+  if season_num and season_num > 0 then
+    local s_padded = string.format("%02d", season_num)
+    -- Season match
+    if string.find(upper, string.format("S%s", s_padded), 1, true) or
+       string.find(upper, string.format("%dX", season_num), 1, true) then
+      score = score + 10
+    else
+      return -1  -- wrong season entirely
+    end
+    if episode_num and episode_num > 0 then
+      local e_padded = string.format("%02d", episode_num)
+      -- Exact episode match
+      if string.find(upper, string.format("E%s", e_padded), 1, true) or
+         string.find(upper, string.format("E0*%d[^0-9]", episode_num)) then
+        score = score + 20  -- individual episode file — highest priority
+      elseif string.find(upper, string.format("S%sE", s_padded), 1, true) then
+        return -1  -- different episode
+      else
+        score = score + 5  -- season pack — lower priority than individual episode
+      end
+    end
+  end
+  return score
+end
+
+function subSource.downloadSubtitle(item)
+  local api_key = trim(openSub.option.subsource_api_key or "")
+  if api_key == "" then
+    setMessage(error_tag("SubSource API key required for download."))
+    return false
+  end
+
+  local sub_id = item.FileID or item.SubtitleID
+  if not sub_id then
+    setMessage(error_tag("No SubSource subtitle ID available."))
+    return false
+  end
+
+  local download_url = build_sorted_url(subSource.base_url .. "/subtitles/" .. tostring(sub_id) .. "/download", { api_key = api_key })
+  vlc.msg.dbg("[SubSource] Downloading subtitle ID " .. tostring(sub_id) .. " from " .. download_url)
+
+  local client = Curl.new()
+  client:set_timeout(30)
+  client:set_retries(2)
+
+  local res = client:get(download_url, true) -- Pass true to prevent binary truncation
+  if not res or res.status ~= 200 or not res.body then
+    local status_str = res and tostring(res.status) or "no response"
+    setMessage(error_tag("SubSource download failed (HTTP " .. status_str .. ")"))
+    return false
+  end
+
+  local raw_body = res.body
+
+  -- Check if we got a JSON redirect to the actual file
+  local ok, parsed = pcall(json.decode, raw_body, 1, true)
+  if ok and parsed and type(parsed) == "table" then
+    local link = parsed.download_url or parsed.link or parsed.url
+    if link then
+      vlc.msg.dbg("[SubSource] Got secondary download URL: " .. link)
+      local dl_res = client:get(link, true)
+      if dl_res and dl_res.status == 200 and dl_res.body then
+        raw_body = dl_res.body
+      end
+    elseif parsed.content then
+      raw_body = parsed.content
+    end
+  end
+
+  if not item.SubFormat then
+    local ext = string.match(item.SubFileName or "", "%.([^%.]+)$")
+    item.SubFormat = ext or "srt"
+  end
+
+  -- Detect ZIP by magic bytes PK\x03\x04
+  local is_zip = (string.sub(raw_body, 1, 2) == "PK")
+  vlc.msg.dbg("[SubSource] Downloaded " .. #raw_body .. " bytes, is_zip=" .. tostring(is_zip))
+
+  if not is_zip then
+    -- Plain SRT/text content
+    local success = openSub.saveAndLoadSubtitle(raw_body, item)
+    if success then setMessage(success_tag("Subtitle downloaded from SubSource!")) end
+    return success
+  end
+
+  -- ---- ZIP handling ----
+  -- Save ZIP to a temp file, extract with PowerShell, pick best SRT
+  local tmp_dir = os.getenv("TEMP") or os.getenv("TMP") or "C:\\Temp"
+  local zip_path = tmp_dir .. "\\vlsub_subsource_" .. tostring(sub_id) .. ".zip"
+  local extract_dir = tmp_dir .. "\\vlsub_subsource_" .. tostring(sub_id)
+
+  vlc.msg.dbg("[SubSource] Saving ZIP to: " .. zip_path)
+  local zf = io.open(zip_path, "wb")
+  if not zf then
+    setMessage(error_tag("Cannot write ZIP temp file"))
+    return false
+  end
+  zf:write(raw_body)
+  zf:flush()
+  zf:close()
+
+  -- Extract ZIP using PowerShell
+  local ps_cmd = string.format(
+    'powershell -NoProfile -Command "Expand-Archive -LiteralPath \'%s\' -DestinationPath \'%s\' -Force"',
+    zip_path, extract_dir
+  )
+  vlc.msg.dbg("[SubSource] Extracting ZIP: " .. ps_cmd)
+  local ok_extract = os.execute(ps_cmd)
+  if not ok_extract then
+    setMessage(error_tag("Failed to extract SubSource ZIP"))
+    return false
+  end
+
+  -- List extracted SRT files using PowerShell
+  local list_cmd = string.format(
+    'powershell -NoProfile -Command "Get-ChildItem -Path \'%s\' -Recurse -Include *.srt,*.sub,*.ass | Select-Object -ExpandProperty FullName"',
+    extract_dir
+  )
+  local pipe = io.popen(list_cmd)
+  local srt_files = {}
+  if pipe then
+    for line in pipe:lines() do
+      local trimmed = line:match("^%s*(.-)%s*$")
+      if trimmed and trimmed ~= "" then
+        table.insert(srt_files, trimmed)
+      end
+    end
+    pipe:close()
+  end
+
+  vlc.msg.dbg("[SubSource] Found " .. #srt_files .. " subtitle file(s) in ZIP")
+  if #srt_files == 0 then
+    setMessage(error_tag("ZIP contained no subtitle files"))
+    return false
+  end
+
+  -- Score each file against the requested season/episode
+  local season_num = 0
+  if input_table and input_table["seasonNumber"] then
+    season_num = tonumber(input_table["seasonNumber"]:get_text()) or 0
+  else
+    season_num = tonumber(openSub.movie.seasonNumber) or tonumber(openSub.movie.season) or 0
+  end
+
+  local episode_num = 0
+  if input_table and input_table["episodeNumber"] then
+    episode_num = tonumber(input_table["episodeNumber"]:get_text()) or 0
+  else
+    episode_num = tonumber(openSub.movie.episodeNumber) or tonumber(openSub.movie.episode) or 0
+  end
+
+  local best_file = srt_files[1]
+  local best_score = -999
+  for _, fpath in ipairs(srt_files) do
+    local fname = fpath:match("[^\\/]+$") or fpath
+    local sc = score_srt_for_episode(fname, season_num, episode_num)
+    vlc.msg.dbg("[SubSource] SRT candidate: " .. fname .. " score=" .. tostring(sc))
+    if sc > best_score then
+      best_score = sc
+      best_file = fpath
+    end
+  end
+
+  vlc.msg.dbg("[SubSource] Selected SRT: " .. best_file .. " (score=" .. tostring(best_score) .. ")")
+
+  local sf = io.open(best_file, "rb")
+  if not sf then
+    setMessage(error_tag("Cannot read extracted SRT: " .. best_file))
+    return false
+  end
+  local srt_content = sf:read("*a")
+  sf:close()
+
+  -- Patch item filename to match selected SRT
+  local selected_name = best_file:match("[^\\/]+$") or item.SubFileName
+  item.SubFileName = selected_name
+  item.SubFormat = selected_name:match("%.([^.]+)$") or "srt"
+
+  local success = openSub.saveAndLoadSubtitle(srt_content, item)
+  if success then
+    setMessage(success_tag("Subtitle downloaded from SubSource! (" .. #srt_files .. " file(s) in ZIP, best match selected)"))
+  end
+  return success
+end
+
+-- Direct manual SubSource search handler
+function searchSubSourceDirect()
+  openSub.lastSearchMethod = "subsource"
+
+  local key = trim(openSub.option.subsource_api_key or "")
+  if key == "" then
+    setMessage(error_tag("Please enter your SubSource API Key in Configuration first."))
+    return
+  end
+
+  openSub.movie.title = trim(input_table["title"]:get_text())
+  openSub.movie.year = trim(input_table["year"]:get_text())
+  openSub.movie.seasonNumber = tonumber(input_table["seasonNumber"]:get_text())
+  openSub.movie.episodeNumber = tonumber(input_table["episodeNumber"]:get_text())
+  local imdbInput = trim(input_table["imdbId"]:get_text())
+  openSub.movie.imdbId = extractIMDBId(imdbInput)
+
+  if openSub.movie.title == "" and (not openSub.movie.imdbId or openSub.movie.imdbId == "") then
+    openSub.getFileInfo()
+    openSub.getMovieInfo()
+    if input_table["title"] and openSub.movie.title then
+      input_table["title"]:set_text(openSub.movie.title)
+    end
+  end
+
+  local langs = getSelectedLanguages()
+  setMessage(loading_tag("Searching SubSource..."))
+
+  local results = subSource.search(
+    openSub.movie.title,
+    langs,
+    openSub.movie.seasonNumber,
+    openSub.movie.episodeNumber,
+    openSub.movie.imdbId,
+    openSub.movie.year,
+    false
+  )
+
+  openSub.itemStore = results
+  display_subtitles()
+
+  if #results > 0 then
+    setMessage(success_tag("SubSource search complete: " .. #results .. " result(s)"))
+  else
+    setMessage(error_tag("No results found on SubSource."))
+  end
+end
 
 
 -- Modified interface_main function - update the help button to pass window context
@@ -1748,7 +2352,7 @@ function interface_main()
   input_table['episodeNumber'] = dlg:add_text_input(
     openSub.movie.episodeNumber or "", 4, 2, 1, 1)
 
-  -- Row 3: Year, IMDB ID
+  -- Row 3: Year, IMDB ID, and Search (SubSource) button
   dlg:add_label("Year:", 1, 3, 1, 1)
   input_table['year'] = dlg:add_text_input(
     openSub.movie.year or "", 2, 3, 1, 1)
@@ -1757,6 +2361,8 @@ function interface_main()
     openSub.movie.imdbId or "", 4, 3, 1, 1)
   dlg:add_button("🔍 "..lang["int_search_name"],
     searchIMBD_v2, 6, 2, 1, 1)
+  dlg:add_button("🔍 "..(lang["int_search_subsource"] or "Search (SubSource)"),
+    searchSubSourceDirect, 6, 3, 1, 1)
 
   -- Row 4: Language selection
   dlg:add_label(lang["int_default_lang"]..":", 1, 4, 1, 1)
@@ -1825,73 +2431,81 @@ function interface_config()
     type(openSub.option.os_password) == "string"
     and openSub.option.os_password or "", 2, 2, 2, 1)
 
-  -- Row 3: Default primary language
-  dlg:add_label(lang["int_default_lang"]..":", 1, 3, 2, 1)
-  input_table['default_language'] = dlg:add_dropdown(3, 3, 1, 1)
+  -- Row 3: SubSource API Key (Optional)
+  dlg:add_label((lang["int_subsource_api_key"] or "SubSource API Key")..":", 1, 3, 1, 1)
+  input_table['subsource_api_key'] = dlg:add_text_input(
+    type(openSub.option.subsource_api_key) == "string"
+    and openSub.option.subsource_api_key or "", 2, 3, 2, 1)
 
-  -- Row 4: Default secondary language
-  dlg:add_label(lang["int_second_lang"]..":", 1, 4, 2, 1)
-  input_table['default_language2'] = dlg:add_dropdown(3, 4, 1, 1)
+  -- Row 4: Default primary language
+  dlg:add_label(lang["int_default_lang"]..":", 1, 4, 2, 1)
+  input_table['default_language'] = dlg:add_dropdown(3, 4, 1, 1)
 
-  -- Row 5: Default third language
-  dlg:add_label(lang["int_third_lang"]..":", 1, 5, 2, 1)
-  input_table['default_language3'] = dlg:add_dropdown(3, 5, 1, 1)
+  -- Row 5: Default secondary language
+  dlg:add_label(lang["int_second_lang"]..":", 1, 5, 2, 1)
+  input_table['default_language2'] = dlg:add_dropdown(3, 5, 1, 1)
 
-  -- Row 6: Download behavior
-  dlg:add_label(lang["int_dowload_behav"]..":", 1, 6, 2, 1)
-  input_table['downloadBehaviour'] = dlg:add_dropdown(3, 6, 1, 1)
+  -- Row 6: Default third language
+  dlg:add_label(lang["int_third_lang"]..":", 1, 6, 2, 1)
+  input_table['default_language3'] = dlg:add_dropdown(3, 6, 1, 1)
 
-  -- Row 7: Display language code
-  dlg:add_label(lang["int_display_code"]..":", 1, 7, 2, 1)
-  input_table['langExt'] = dlg:add_dropdown(3, 7, 1, 1)
+  -- Row 7: Download behavior
+  dlg:add_label(lang["int_dowload_behav"]..":", 1, 7, 2, 1)
+  input_table['downloadBehaviour'] = dlg:add_dropdown(3, 7, 1, 1)
 
-  -- Row 8: Remove tags
-  dlg:add_label(lang["int_remove_tag"]..":", 1, 8, 2, 1)
-  input_table['removeTag'] = dlg:add_dropdown(3, 8, 1, 1)
+  -- Row 8: Display language code
+  dlg:add_label(lang["int_display_code"]..":", 1, 8, 2, 1)
+  input_table['langExt'] = dlg:add_dropdown(3, 8, 1, 1)
 
-  -- REMOVED: Row 9: Use curl option (no longer needed)
+  -- Row 9: Remove tags
+  dlg:add_label(lang["int_remove_tag"]..":", 1, 9, 2, 1)
+  input_table['removeTag'] = dlg:add_dropdown(3, 9, 1, 1)
 
-  -- Row 9: Working directory (moved up from row 10)
+  -- Row 10: Working directory
   if openSub.conf.dirPath then
     if openSub.conf.os == "lin" then
-      dlg:add_label(lang["int_vlsub_work_dir"], 1, 9, 2, 1)
+      dlg:add_label(lang["int_vlsub_work_dir"], 1, 10, 2, 1)
     elseif openSub.conf.os == "win" then
       dlg:add_label(
         "<a href='file:///"..openSub.conf.dirPath.."'>"..
-        lang["int_vlsub_work_dir"].."</a>", 1, 9, 2, 1)
+        lang["int_vlsub_work_dir"].."</a>", 1, 10, 2, 1)
     else
       dlg:add_label(
         "<a href='"..openSub.conf.dirPath.."'>"..
-        lang["int_vlsub_work_dir"].."</a>", 1, 9, 2, 1)
+        lang["int_vlsub_work_dir"].."</a>", 1, 10, 2, 1)
     end
   else
-    dlg:add_label(lang["int_vlsub_work_dir"], 1, 9, 2, 1)
+    dlg:add_label(lang["int_vlsub_work_dir"], 1, 10, 2, 1)
   end
 
   input_table['dir_path'] = dlg:add_text_input(
-    openSub.conf.dirPath, 2, 9, 2, 1)
+    openSub.conf.dirPath, 2, 10, 2, 1)
 
-  -- Row 10: Status message (moved up from row 11)
+  -- Row 11: OpenSubtitles status message
   input_table['message'] = nil
-  input_table['message'] = dlg:add_label('', 1, 10, 4, 1)
+  input_table['message'] = dlg:add_label('', 1, 11, 4, 1)
 
-  -- Row 11: Action buttons (moved up from row 12)
+  -- Row 12: SubSource status message
+  input_table['subsource_message'] = nil
+  input_table['subsource_message'] = dlg:add_label('', 1, 12, 4, 1)
+
+  -- Row 13: Action buttons
   dlg:add_button(
     "💾 " .. lang["int_save"],
-    apply_config, 1, 11, 1, 1)
+    apply_config, 1, 13, 1, 1)
 
   dlg:add_button(
     "❓ " .. lang["int_help"],
     function() show_help("config") end,
-    2, 11, 1, 1)
+    2, 13, 1, 1)
 
   dlg:add_button(
     "🔄 Check Updates",
-    function() check_for_updates(true) end, 3, 11, 1, 1)
+    function() check_for_updates(true) end, 3, 13, 1, 1)
 
   dlg:add_button(
     "❌ " .. lang["int_close"],
-    show_main, 4, 11, 1, 1)
+    show_main, 4, 13, 1, 1)
 
   -- Setup dropdown values for existing dropdowns
   input_table['langExt']:add_value(
@@ -2440,6 +3054,10 @@ function buildSubtitleDisplayText(item, langCode)
   -- Add language code at the beginning with spaces (e.g., "EN | ")
   displayText = string.upper(langCode) .. " | "
 
+  if item.Provider == "SubSource" then
+    displayText = displayText .. "[SubSource] "
+  end
+
   -- Add filename/release name
   displayText = displayText .. (item.SubFileName or "???")
 
@@ -2876,13 +3494,15 @@ function apply_config()
     end
   end
 
-  -- Get username and password, trim whitespace
+  -- Get username, password, and SubSource API key, trim whitespace
   local username = trim(input_table['os_username']:get_text() or "")
   local password = trim(input_table['os_password']:get_text() or "")
+  local subsource_key = trim(input_table['subsource_api_key'] and input_table['subsource_api_key']:get_text() or "")
 
   -- Set the trimmed values
   openSub.option.os_username = username
   openSub.option.os_password = password
+  openSub.option.subsource_api_key = (subsource_key ~= "" and subsource_key or nil)
 
   -- Save boolean options (these should always be saved regardless of login status)
   if input_table["langExt"]:get_value() == 2 then
@@ -2906,11 +3526,11 @@ function apply_config()
     or not dir_path then
       local other_dirs = {}
 
-      for path in
+      for raw_path in
       vlc.config.get(
         "sub-autodetect-path"):gmatch("[^,]+"
       ) do
-        path = trim(path)
+        local path = trim(raw_path)
         if path ~= (openSub.conf.dirPath or "")..sub_dir then
           table.insert(other_dirs, path)
         end
@@ -2964,16 +3584,28 @@ function apply_config()
   end
 
 
-  -- NOW HANDLE LOGIN VALIDATION (after config is saved)
-  -- Check if we have credentials for login test
+  -- NOW HANDLE LOGIN VALIDATION & SUBSOURCE KEY VALIDATION (after config is saved)
+  -- 1. Validate SubSource API key if provided
+  if subsource_key ~= "" then
+    setSubsourceMessage(loading_tag("Validating SubSource Key..."))
+    local ss_ok, ss_info = subSource.validateKey(subsource_key)
+    if ss_ok then
+      setSubsourceMessage(success_tag("SubSource: API Key validated successfully!"))
+    else
+      setSubsourceMessage(error_tag("SubSource: " .. ss_info))
+    end
+  else
+    setSubsourceMessage("")
+  end
+
+  -- 2. Validate OpenSubtitles credentials
   if username == "" or password == "" then
-    -- No credentials provided - still show success for saved settings
     setMessage(success_tag("Configuration saved. Please enter OpenSubtitles.com credentials for full functionality."))
     is_authenticated = false
     return
   end
 
-  -- We have credentials, test login
+  -- We have OpenSubtitles credentials, test login
   setMessage(loading_tag("Testing login credentials..."))
 
   -- Clear any existing session to force fresh login for verification
@@ -2985,14 +3617,6 @@ function apply_config()
 
   if login_success then
     is_authenticated = true
-    -- Keep the successful message that was set by checkLoginAndUserInfo
-    local current_message = input_table["message"]:get_text()
-    if current_message and string.find(current_message, "Success") then
-      setMessage(current_message .. "<br>Configuration saved. You can now close this window.")
-    else
-      setMessage(success_tag("Configuration saved and login successful! You can now close this window."))
-    end
-
     -- Refresh the interface to show the enabled close button
     vlc.msg.dbg("[VLSub] Authentication successful, refreshing config interface")
     if dlg then
@@ -3001,17 +3625,10 @@ function apply_config()
   else
     -- Login failed, but config was still saved
     is_authenticated = false
-    local current_message = input_table["message"]:get_text()
-
-    -- Check if there's already an error message from the login attempt
-    if current_message and (string.find(current_message, "Error") or string.find(current_message, "failed")) then
-      -- Append config saved notice to existing error message
-      setMessage(current_message .. "<br><small>Note: Other configuration settings were saved successfully.</small>")
-    else
-      -- Generic login failure message with config saved notice
-      setMessage(error_tag("Login failed - please check your credentials.<br><small>Other configuration settings were saved successfully.</small>"))
+    local current_message = input_table["message"] and input_table["message"]:get_text() or ""
+    if current_message == "" then
+      setMessage(error_tag("OpenSubtitles.com: Login failed - please check your credentials."))
     end
-
     vlc.msg.dbg("[VLSub] Login failed but configuration was saved")
   end
 end
@@ -4248,6 +4865,15 @@ function setMessage(str)
   if input_table["message"] then
     input_table["message"]:set_text(str)
     dlg:update()
+  end
+end
+
+function setSubsourceMessage(str)
+  if input_table["subsource_message"] then
+    input_table["subsource_message"]:set_text(str or "")
+    if dlg then
+      dlg:update()
+    end
   end
 end
 
@@ -5799,6 +6425,10 @@ function download_subtitles_v2()
   setMessage(openSub.actionLabel..": "..progressBarContent(10))
 
   local item = openSub.itemStore[index]
+
+  if item and item.Provider == "SubSource" then
+    return subSource.downloadSubtitle(item)
+  end
 
   -- Check if manual download is explicitly requested
   if openSub.option.downloadBehaviour == 'manual' then
@@ -7996,17 +8626,14 @@ function build_sorted_url(base_url, params_table)
     -- Convert filtered params table to array for sorting
     local sorted_params = {}
     for key, value in pairs(filtered_params) do
-        -- Check if this is an x-* parameter (should preserve case)
-        local is_x_param = string.match(string.lower(key), "^x%-") ~= nil
-
-        -- Convert parameter name to lowercase (except x-* params)
-        local processed_key = is_x_param and key or string.lower(key)
+        -- Preserve original key casing (camelCase like searchType must not be lowercased)
+        local processed_key = key
         local processed_value = tostring(value)
 
-        -- Only apply ID cleanup for non-x-* parameters
-        if not is_x_param then
-            -- Clean up IMDB IDs: remove 'tt' prefix and leading zeros
-            if processed_key == "imdb_id" then
+        -- Clean up IMDB IDs: remove 'tt' prefix and leading zeros
+        do
+            local lkey = string.lower(processed_key)
+            if lkey == "imdb_id" then
                 -- Remove 'tt' prefix if present (case-insensitive)
                 processed_value = string.gsub(processed_value, "^[Tt][Tt]", "")
                 -- Remove leading zeros
@@ -8026,8 +8653,7 @@ function build_sorted_url(base_url, params_table)
                 end
             end
 
-            -- Convert value to lowercase (except for x-* params)
-            processed_value = string.lower(processed_value)
+            -- NOTE: Do NOT lowercase values — this would corrupt API keys and other case-sensitive values
         end
 
         table.insert(sorted_params, {key = processed_key, value = processed_value})
@@ -8173,6 +8799,30 @@ openSub.searchSubtitlesNewAPI = function()
   else
     vlc.msg.err("[VLSub] API request failed - no response")
     openSub.itemStore = "0"
+  end
+
+  -- SubSource Automatic Fallback Trigger
+  local ss_key = trim(openSub.option.subsource_api_key or "")
+  local hasNoOSResults = (not openSub.itemStore or openSub.itemStore == "0" or (type(openSub.itemStore) == "table" and #openSub.itemStore == 0))
+  local is429 = (res and res.status == 429)
+
+  if (hasNoOSResults or is429) and ss_key ~= "" then
+    vlc.msg.dbg("[VLSub] OpenSubtitles returned 0 results or 429 rate limit. Triggering SubSource automatic fallback.")
+    setMessage(loading_tag("OpenSubtitles (0 results/429) -> Searching SubSource..."))
+    local ss_results = subSource.search(
+      openSub.movie.title,
+      openSub.movie.sublanguageid,
+      openSub.movie.seasonNumber,
+      openSub.movie.episodeNumber,
+      openSub.movie.imdbId,
+      openSub.movie.year,
+      false
+    )
+    if #ss_results > 0 then
+      openSub.itemStore = ss_results
+      openSub.lastSearchMethod = "subsource_fallback"
+      setMessage(success_tag("Found " .. #ss_results .. " subtitle(s) on SubSource!"))
+    end
   end
 end
 
@@ -8380,18 +9030,22 @@ function VLCHttpClient:_build_url_params(url, data)
 
     -- Step 2: Add headers as URL parameters (these will override any existing ones with same names)
     for key, value in pairs(self.headers) do
+        local k_lower = key:lower()
         local param_name
-        if key:lower() == "authorization" then
+        if k_lower == "authorization" or k_lower == "x-authorization" then
             param_name = "x-authorization"
-        elseif key:lower() == "api-key" then
+        elseif k_lower == "api-key" or k_lower == "x-api-key" then
             param_name = "x-api-key"
-        elseif key:lower() == "content-type" then
+        elseif k_lower == "content-type" or k_lower == "x-content-type" then
             param_name = "x-content-type"
-        elseif key:lower() == "user-agent" then
-            -- Also send user-agent as x-user-agent for server-side tracking
+        elseif k_lower == "user-agent" or k_lower == "x-user-agent" then
             param_name = "x-user-agent"
+        elseif k_lower == "accept" or k_lower == "x-accept" then
+            param_name = "x-accept"
+        elseif string.sub(k_lower, 1, 2) == "x-" then
+            param_name = k_lower
         else
-            param_name = "x-" .. key:lower():gsub("-", "-")
+            param_name = "x-" .. k_lower
         end
         if param_name then
             all_params[param_name] = value
@@ -8613,7 +9267,7 @@ local function clean_response_body(body, headers)
     return cleaned
 end
 
-function VLCHttpClient:_make_request_stream(method, url, data)
+function VLCHttpClient:_make_request_stream(method, url, data, is_binary)
     vlc.msg.dbg("[VLSub] Using optimized vlc.stream for HTTPS request")
 
     -- Build final URL with minimal parameters to reduce URL length
@@ -8627,7 +9281,7 @@ function VLCHttpClient:_make_request_stream(method, url, data)
 
     local response_data = ""
     local chunk_size = 16384  -- Larger chunks for better performance
-    local max_size = 1048576  -- 1MB limit
+    local max_size = 10485760 -- 10MB limit (subtitles can be a few MB if zipped)
     local bytes_read = 0
 
     -- Read with timeout
@@ -8647,8 +9301,8 @@ function VLCHttpClient:_make_request_stream(method, url, data)
         response_data = response_data .. chunk
         bytes_read = bytes_read + #chunk
 
-        -- Early break if we detect end of JSON
-        if string.find(chunk, "}$") and string.find(response_data, "^{") then
+        -- Early break if we detect end of JSON (only if not binary)
+        if not is_binary and string.find(chunk, "}$") and string.find(response_data, "^{") then
             vlc.msg.dbg("[VLSub] Detected complete JSON, stopping read")
             break
         end
@@ -8658,7 +9312,7 @@ function VLCHttpClient:_make_request_stream(method, url, data)
                 string.format("%.2f", (os.clock() - start_time)) .. " seconds")
 
     if bytes_read > 0 then
-        local cleaned_body = clean_response_body(response_data, {})
+        local cleaned_body = is_binary and response_data or clean_response_body(response_data, {})
         return {
             status = 200,
             headers = {},
@@ -8670,7 +9324,7 @@ function VLCHttpClient:_make_request_stream(method, url, data)
 end
 
 -- Use vlc.net.connect_tcp for HTTP requests
-function VLCHttpClient:_make_request_tcp(method, url, data)
+function VLCHttpClient:_make_request_tcp(method, url, data, is_binary)
     local host, path, option, protocol = parse_url(url)
     local port = (protocol == "https") and 443 or 80
     if not protocol or not host then
@@ -8928,7 +9582,7 @@ function VLCHttpClient:_make_request_tcp(method, url, data)
                     end
 
                     -- Clean the response body to handle chunked encoding and other artifacts
-                    local cleaned_body = clean_response_body(body, headers)
+                    local cleaned_body = is_binary and body or clean_response_body(body, headers)
 
                     if openSub.option.debugLogging then
                       vlc.msg.dbg("[VLSub] Cleaned body: " .. string.len(cleaned_body) .. " bytes")
@@ -8958,7 +9612,7 @@ function VLCHttpClient:_make_request_tcp(method, url, data)
 end
 
 -- Main request method - chooses implementation based on protocol
-function VLCHttpClient:_make_request(method, url, data)
+function VLCHttpClient:_make_request(method, url, data, is_binary)
     -- Log the full URL for complete visibility
     vlc.msg.warn("[VLSub] " .. method .. " " .. url)
 
@@ -8973,15 +9627,15 @@ function VLCHttpClient:_make_request(method, url, data)
     -- HTTPS -> use vlc.stream
     -- HTTP -> use vlc.net.connect_tcp
     if protocol == "https" then
-        return self:_make_request_stream(method, url, data)
+        return self:_make_request_stream(method, url, data, is_binary)
     else
-        return self:_make_request_tcp(method, url, data)
+        return self:_make_request_tcp(method, url, data, is_binary)
     end
 end
 
 -- Public HTTP methods
-function VLCHttpClient:get(url)
-    return self:_make_request("GET", url)
+function VLCHttpClient:get(url, is_binary)
+    return self:_make_request("GET", url, nil, is_binary)
 end
 
 function VLCHttpClient:post(url, data)
