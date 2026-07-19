@@ -2608,6 +2608,7 @@ function ai_start_transcription(model_index, status_label)
   local done_flag = ai_dir .. slash .. "whisper_done.txt"
   local status_file = ai_dir .. slash .. "ai_status.txt"
   local ps1_file = ai_dir .. slash .. "ai_runner.ps1"
+  local abort_flag = ai_dir .. slash .. "abort_flag.txt"
 
   -- Ensure directory exists before Lua tries to write the ps1 file
   if not is_dir(ai_dir) then
@@ -2648,6 +2649,24 @@ $srt_out = "%s"
 $done_flag = "%s"
 $status_file = "%s"
 $video_uri = "%s"
+$abort_flag = "%s"
+
+if (Test-Path $abort_flag) { Remove-Item $abort_flag }
+
+Function Monitor-Process {
+    param($proc)
+    while (-not $proc.HasExited) {
+        if ((Get-Process -Name vlc -ErrorAction SilentlyContinue) -eq $null) {
+            $proc.Kill()
+            exit
+        }
+        if (Test-Path $abort_flag) {
+            $proc.Kill()
+            exit
+        }
+        Start-Sleep -Milliseconds 500
+    }
+}
 
 Set-Content -Path $status_file -Value "Checking dependencies..."
 
@@ -2683,7 +2702,8 @@ $vlcArgs = @(
     "--sout=#transcode{acodec=s16l,channels=1,samplerate=16000}:std{access=file,mux=wav,dst='$audio_wav'}",
     "vlc://quit"
 )
-Start-Process -FilePath $vlc -ArgumentList $vlcArgs -Wait -WindowStyle Hidden
+$vlcProc = Start-Process -FilePath $vlc -ArgumentList $vlcArgs -PassThru -WindowStyle Hidden
+Monitor-Process -proc $vlcProc
 
 if (-not (Test-Path $audio_wav)) {
     Set-Content -Path $status_file -Value "Error: Audio extraction failed."
@@ -2691,11 +2711,12 @@ if (-not (Test-Path $audio_wav)) {
 }
 
 Set-Content -Path $status_file -Value "Transcribing...You may play the video."
-Start-Process -FilePath $whisper_exe -ArgumentList "-m `"$model_bin`" -f `"$audio_wav`" -osrt" -RedirectStandardOutput "$srt_out.live" -Wait -WindowStyle Hidden
+$whisperProc = Start-Process -FilePath $whisper_exe -ArgumentList "-m `"$model_bin`" -f `"$audio_wav`" -osrt" -RedirectStandardOutput "$srt_out.live" -PassThru -WindowStyle Hidden
+Monitor-Process -proc $whisperProc
 
 Set-Content -Path $status_file -Value "Done!"
 Set-Content -Path $done_flag -Value "DONE"
-]], ai_dir, whisper_exe, model_bin, audio_wav, srt_out, done_flag, status_file, video_uri, model_name)
+]], ai_dir, whisper_exe, model_bin, audio_wav, srt_out, done_flag, status_file, video_uri, abort_flag, model_name)
 
   f:write(ps_script)
   f:close()
@@ -2714,6 +2735,17 @@ Set-Content -Path $done_flag -Value "DONE"
           while (os.clock() - delay_start) < 0.5 do end
       end
       if vlc.keep_alive then vlc.keep_alive() end
+      
+      -- Video switch detection
+      local current_item = vlc.input.item()
+      local current_uri = ""
+      if current_item then current_uri = current_item:uri() end
+      if current_uri ~= video_uri then
+          local f = io.open(abort_flag, "w")
+          if f then f:write("ABORT"); f:close() end
+          ai_is_running = false
+          break
+      end
       
       -- Update status label from file and push to OSD
       local sf = io.open(status_file, "r")
@@ -2776,6 +2808,21 @@ Set-Content -Path $done_flag -Value "DONE"
   os.remove(done_flag)
   os.remove(ps1_file)
   os.remove(srt_out .. ".live")
+  os.remove(abort_flag)
+end
+
+function ai_abort_proxy()
+  local abort_flag = openSub.conf.dirPath .. slash .. "vlsub_ai" .. slash .. "abort_flag.txt"
+  local f = io.open(abort_flag, "w")
+  if f then
+      f:write("ABORT")
+      f:close()
+  end
+  ai_is_running = false
+  if input_table and input_table['ai_status'] then
+      input_table['ai_status']:set_text("Status: Aborted")
+  end
+  vlc.osd.message("AI Transcription Aborted.", 1, "top-right", 3000000)
 end
 
 function ai_start_transcription_proxy()
@@ -2818,8 +2865,9 @@ function interface_main()
   input_table['ai_model'] = dlg:add_dropdown(6, 4, 1, 1)
   input_table['ai_model']:add_value("tiny.en", 1)
   input_table['ai_model']:add_value("base.en", 2)
-  input_table['ai_start'] = dlg:add_button("🎙️ Transcribe", ai_start_transcription_proxy, 6, 5, 1, 1)
-  input_table['ai_status'] = dlg:add_label("Ready", 6, 6, 1, 1)
+  input_table['ai_start'] = dlg:add_button("🎙️ Transcribe", ai_start_transcription_proxy, 5, 5, 1, 1)
+  input_table['ai_abort'] = dlg:add_button("🛑 Abort", ai_abort_proxy, 6, 5, 1, 1)
+  input_table['ai_status'] = dlg:add_label("Ready", 5, 6, 2, 1)
 
   -- Row 4: Language selection
   dlg:add_label(lang["int_default_lang"]..":", 1, 4, 1, 1)
