@@ -2520,6 +2520,270 @@ function show_more_action()
   save_config()
 end
 
+-- ==============================================================================
+-- AI Transcription Logic
+-- ==============================================================================
+local ai_dlg = nil
+local ai_is_running = false
+
+-- Utility to check if file exists
+local function ai_file_exists(name)
+  local f = io.open(name, "r")
+  if f ~= nil then io.close(f) return true else return false end
+end
+
+-- Parse SRT file into Lua table
+local function ai_parse_srt(filepath)
+  local f = io.open(filepath, "r")
+  if not f then return {} end
+  
+  local subs = {}
+  local state = 0
+  local current_sub = {}
+  for line in f:lines() do
+      line = string.gsub(line, "\r", "")
+      
+      -- Format 1: Whisper stdout [00:00:00.000 --> 00:00:00.000] Text
+      local w_ts, w_te, w_text = string.match(line, "^%[(%d%d:%d%d:%d%d%.%d%d%d) %-%-%> (%d%d:%d%d:%d%d%.%d%d%d)%]%s*(.*)")
+      if w_ts and w_te then
+          local function parse_time(t)
+              local h,m,s,ms = string.match(t, "(%d%d):(%d%d):(%d%d)[%,%.](%d%d%d)")
+              return tonumber(h)*3600 + tonumber(m)*60 + tonumber(s) + tonumber(ms)/1000
+          end
+          table.insert(subs, {
+              start_s = parse_time(w_ts),
+              end_s = parse_time(w_te),
+              text = w_text
+          })
+      else
+          -- Format 2: Standard SRT State Machine
+          if state == 0 and string.match(line, "^%d+$") then
+              state = 1
+              current_sub = {text=""}
+          elseif state == 1 then
+              local ts, te = string.match(line, "(%d%d:%d%d:%d%d,%d%d%d) %-%-%> (%d%d:%d%d:%d%d,%d%d%d)")
+              if ts and te then
+                  local function parse_time(t)
+                      local h,m,s,ms = string.match(t, "(%d%d):(%d%d):(%d%d),(%d%d%d)")
+                      return tonumber(h)*3600 + tonumber(m)*60 + tonumber(s) + tonumber(ms)/1000
+                  end
+                  current_sub.start_s = parse_time(ts)
+                  current_sub.end_s = parse_time(te)
+                  state = 2
+              else
+                  state = 0 -- invalid
+              end
+          elseif state == 2 then
+              if line == "" then
+                  table.insert(subs, current_sub)
+                  state = 0
+              else
+                  current_sub.text = current_sub.text == "" and line or (current_sub.text .. "\n" .. line)
+              end
+          end
+      end
+  end
+  if state == 2 and current_sub.text ~= "" then
+      table.insert(subs, current_sub)
+  end
+  f:close()
+  return subs
+end
+
+function ai_start_transcription(model_index, status_label)
+  if ai_is_running then return end
+  ai_is_running = true
+
+  local model_names = {"tiny.en", "base.en"}
+  local model_name = model_names[model_index] or "tiny.en"
+  
+  -- Store everything in a dedicated vlsub_ai subfolder
+  local ai_dir = openSub.conf.dirPath .. slash .. "vlsub_ai"
+
+  local whisper_zip = ai_dir .. slash .. "whisper-bin-x64.zip"
+  local whisper_exe = ai_dir .. slash .. "main.exe"
+  local model_bin = ai_dir .. slash .. "ggml-" .. model_name .. ".bin"
+  local audio_wav = ai_dir .. slash .. "temp_audio.wav"
+  local srt_out = ai_dir .. slash .. "temp_audio.wav.srt"
+  local done_flag = ai_dir .. slash .. "whisper_done.txt"
+  local status_file = ai_dir .. slash .. "ai_status.txt"
+  local ps1_file = ai_dir .. slash .. "ai_runner.ps1"
+
+  -- Ensure directory exists before Lua tries to write the ps1 file
+  if not is_dir(ai_dir) then
+      local success = os.execute('powershell -WindowStyle Hidden -Command "New-Item -ItemType Directory -Force -Path \'' .. ai_dir .. '\'"')
+  end
+
+  local item = vlc.input.item()
+  if not item then
+    status_label:set_text("Status: Error - No video loaded.")
+    ai_is_running = false
+    return
+  end
+  local video_uri = item:uri()
+  if not string.match(video_uri, "^file://") then
+      vlc.osd.message("AI Error: Transcription is currently only supported for local files.", 1, "center", 5000000)
+      status_label:set_text("Status: Error - Network stream not supported.")
+      ai_is_running = false
+      return
+  end
+
+  -- Write the background PowerShell script
+  local f = io.open(ps1_file, "w")
+  if not f then
+      status_label:set_text("Status: Error writing script.")
+      ai_is_running = false
+      return
+  end
+
+  local ps_script = string.format([[
+$ErrorActionPreference = "SilentlyContinue"
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+$ai_dir = "%s"
+$whisper_exe = "%s"
+$model_bin = "%s"
+$audio_wav = "%s"
+$srt_out = "%s"
+$done_flag = "%s"
+$status_file = "%s"
+$video_uri = "%s"
+
+Set-Content -Path $status_file -Value "Checking dependencies..."
+
+if (-not (Test-Path $whisper_exe)) {
+    Set-Content -Path $status_file -Value "Downloading Whisper..."
+    $wc = New-Object System.Net.WebClient
+    $wc.DownloadFile("https://github.com/ggerganov/whisper.cpp/releases/download/v1.5.4/whisper-bin-x64.zip", "$ai_dir\whisper-bin-x64.zip")
+    Set-Content -Path $status_file -Value "Extracting Whisper..."
+    Expand-Archive -Force -Path "$ai_dir\whisper-bin-x64.zip" -DestinationPath $ai_dir
+}
+
+if (-not (Test-Path $model_bin)) {
+    Set-Content -Path $status_file -Value "Downloading Model..."
+    $wc = New-Object System.Net.WebClient
+    $wc.DownloadFile("https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-%s.bin", $model_bin)
+}
+
+Set-Content -Path $status_file -Value "Extracting audio (~30s)..."
+if (Test-Path $audio_wav) { Remove-Item $audio_wav }
+if (Test-Path $srt_out) { Remove-Item $srt_out }
+if (Test-Path "$srt_out.live") { Remove-Item "$srt_out.live" }
+if (Test-Path $done_flag) { Remove-Item $done_flag }
+
+$vlc = (Get-Process -Name vlc | Select-Object -First 1).Path
+if (-not $vlc) { $vlc = "vlc.exe" }
+
+$vlcArgs = @(
+    "-I", "dummy",
+    "--no-one-instance",
+    "--no-loop",
+    "--no-video",
+    $video_uri,
+    "--sout=#transcode{acodec=s16l,channels=1,samplerate=16000}:std{access=file,mux=wav,dst='$audio_wav'}",
+    "vlc://quit"
+)
+Start-Process -FilePath $vlc -ArgumentList $vlcArgs -Wait -WindowStyle Hidden
+
+if (-not (Test-Path $audio_wav)) {
+    Set-Content -Path $status_file -Value "Error: Audio extraction failed."
+    exit
+}
+
+Set-Content -Path $status_file -Value "Transcribing..."
+Start-Process -FilePath $whisper_exe -ArgumentList "-m `"$model_bin`" -f `"$audio_wav`" -osrt" -RedirectStandardOutput "$srt_out.live" -Wait -WindowStyle Hidden
+
+Set-Content -Path $status_file -Value "Done!"
+Set-Content -Path $done_flag -Value "DONE"
+]], ai_dir, whisper_exe, model_bin, audio_wav, srt_out, done_flag, status_file, video_uri, model_name)
+
+  f:write(ps_script)
+  f:close()
+
+  -- Run powershell asynchronously
+  os.execute(string.format('start /b powershell -ExecutionPolicy Bypass -WindowStyle Hidden -File "%s"', ps1_file))
+
+  -- OSD Polling Loop
+  local input_obj = vlc.object.input()
+  local last_status = ""
+  while ai_is_running and not ai_file_exists(done_flag) do
+      if vlc.misc and vlc.misc.mwait and vlc.misc.mdate then
+          vlc.misc.mwait(vlc.misc.mdate() + 500000)
+      else
+          local delay_start = os.clock()
+          while (os.clock() - delay_start) < 0.5 do end
+      end
+      if vlc.keep_alive then vlc.keep_alive() end
+      
+      -- Update status label from file and push to OSD
+      local sf = io.open(status_file, "r")
+      if sf then
+          local s_text = sf:read("*line")
+          sf:close()
+          if s_text and s_text ~= last_status then
+              vlc.osd.message("AI: " .. s_text, 1, "top-right", 3000000)
+              last_status = s_text
+          end
+          if s_text and input_table and input_table['ai_status'] then
+              input_table['ai_status']:set_text(s_text)
+          end
+          if string.match(s_text or "", "^Error") then
+              ai_is_running = false
+              break
+          end
+      end
+      
+      -- Push OSD
+      local current_time = vlc.var.get(input_obj, "time")
+      if current_time then
+          current_time = current_time / 1000000
+          
+          local live_file = srt_out .. ".live"
+          local subs = {}
+          if ai_file_exists(live_file) then
+              subs = ai_parse_srt(live_file)
+          elseif ai_file_exists(srt_out) then
+              subs = ai_parse_srt(srt_out)
+          end
+          
+          local found_text = nil
+          for _, sub in ipairs(subs) do
+              if current_time >= sub.start_s and current_time <= sub.end_s then
+                  found_text = sub.text
+                  break
+              end
+          end
+          
+          if found_text then
+              vlc.osd.message(found_text, 1, "bottom", 1000000)
+          end
+      end
+  end
+
+  ai_is_running = false
+
+  -- Seamless handoff
+  if ai_file_exists(srt_out) then
+      add_sub(srt_out)
+      vlc.osd.message("AI Transcription Complete! Native subtitles loaded.", 1, "bottom", 4000000)
+      if input_table and input_table['ai_status'] then
+          input_table['ai_status']:set_text("Completed!")
+      end
+  end
+  
+  -- Cleanup temp files
+  os.remove(audio_wav)
+  os.remove(done_flag)
+  os.remove(ps1_file)
+  os.remove(srt_out .. ".live")
+end
+
+function ai_start_transcription_proxy()
+  if not input_table or not input_table['ai_model'] or not input_table['ai_status'] then return end
+  ai_start_transcription(input_table['ai_model']:get_value(), input_table['ai_status'])
+end
+
+
 -- Modified interface_main function - update the help button to pass window context
 function interface_main()
   -- Row 1: Title field and Search by Hash button
@@ -2549,17 +2813,25 @@ function interface_main()
   dlg:add_button("🔍 "..(lang["int_search_subsource"] or "Search (SubSource)"),
     searchSubSourceDirect, 6, 3, 1, 1)
 
+  -- AI Transcription UI
+  dlg:add_label("AI Model:", 5, 4, 1, 1)
+  input_table['ai_model'] = dlg:add_dropdown(6, 4, 1, 1)
+  input_table['ai_model']:add_value("tiny.en", 1)
+  input_table['ai_model']:add_value("base.en", 2)
+  input_table['ai_start'] = dlg:add_button("🎙️ Transcribe", ai_start_transcription_proxy, 6, 5, 1, 1)
+  input_table['ai_status'] = dlg:add_label("Ready", 6, 6, 1, 1)
+
   -- Row 4: Language selection
   dlg:add_label(lang["int_default_lang"]..":", 1, 4, 1, 1)
-  input_table['language'] =  dlg:add_dropdown(2, 4, 4, 1)
+  input_table['language'] =  dlg:add_dropdown(2, 4, 3, 1)
 
   -- Row 5: Secondary language
   dlg:add_label(lang["int_second_lang"]..":", 1, 5, 1, 1)
-  input_table['language2'] =  dlg:add_dropdown(2, 5, 4, 1)
+  input_table['language2'] =  dlg:add_dropdown(2, 5, 3, 1)
 
   -- Row 6: Third language
   dlg:add_label(lang["int_third_lang"]..":", 1, 6, 1, 1)
-  input_table['language3'] = dlg:add_dropdown(2, 6, 4, 1)
+  input_table['language3'] = dlg:add_dropdown(2, 6, 3, 1)
 
   -- Row 7: Sorting controls
   dlg:add_label("Sort by:", 1, 7, 1, 1)
