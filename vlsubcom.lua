@@ -1735,6 +1735,50 @@ end
 subSource = {}
 subSource.base_url = "https://api.subsource.net/api/v1"
 
+subSource.limits = {
+  minute = { max = 60 },
+  hour = { max = 1800 },
+  day = { max = 7200 }
+}
+
+function subSource.trackRequest()
+  local now = os.time()
+  if type(openSub.option.subSourceLimits) ~= "table" then
+    openSub.option.subSourceLimits = {
+      minute = { count = 0, resets_at = 0 },
+      hour = { count = 0, resets_at = 0 },
+      day = { count = 0, resets_at = 0 }
+    }
+  end
+  local limits = openSub.option.subSourceLimits
+  if limits.minute.resets_at <= now then
+    limits.minute.count = 0
+    limits.minute.resets_at = now + 60
+  end
+  if limits.hour.resets_at <= now then
+    limits.hour.count = 0
+    limits.hour.resets_at = now + 3600
+  end
+  if limits.day.resets_at <= now then
+    limits.day.count = 0
+    limits.day.resets_at = now + 86400
+  end
+  limits.minute.count = limits.minute.count + 1
+  limits.hour.count = limits.hour.count + 1
+  limits.day.count = limits.day.count + 1
+  -- Don't call save_config() here on every single request because it causes lag.
+  -- We'll save_config() after the search is completely done.
+end
+
+function subSource.getLimitsString()
+  if type(openSub.option.subSourceLimits) ~= "table" then return "" end
+  local limits = openSub.option.subSourceLimits
+  local m = math.max(0, subSource.limits.minute.max - limits.minute.count)
+  local h = math.max(0, subSource.limits.hour.max - limits.hour.count)
+  local d = math.max(0, subSource.limits.day.max - limits.day.count)
+  return string.format(" | API limits remaining: min(%d) hr(%d) day(%d)", m, h, d)
+end
+
 function subSource.validateKey(api_key)
   if not api_key or trim(api_key) == "" then
     return false, "SubSource API Key is empty"
@@ -1747,6 +1791,7 @@ function subSource.validateKey(api_key)
   client:set_timeout(10)
   client:set_retries(1)
 
+  subSource.trackRequest()
   local res = client:get(test_url)
   if not res then
     return false, "SubSource server did not respond"
@@ -1948,8 +1993,12 @@ function subSource.search(movie_title, languages_str, season, episode, imdb_id, 
     local url = build_sorted_url(subSource.base_url .. "/movies/search", {
       searchType = "text", q = query, api_key = api_key
     })
-    vlc.msg.dbg("[SubSource] Movie search: " .. url)
+    vlc.msg.dbg("[SubSource] Movie search: " .. string.gsub(url, "api_key=[^&]+", "api_key=***"))
+    subSource.trackRequest()
     local r = client:get(url)
+    if r and (r.status == 401 or r.status == 403) then
+      setMessage(error_tag("Auth failed: Incorrect SubSource API key."))
+    end
     if r and r.status == 200 and r.body then
       vlc.msg.dbg("[SubSource] Movie search response: " .. string.sub(r.body, 1, 800))
       local ok, parsed = pcall(json.decode, r.body, 1, true)
@@ -1966,7 +2015,12 @@ function subSource.search(movie_title, languages_str, season, episode, imdb_id, 
     local url = build_sorted_url(subSource.base_url .. "/movies/search", {
       searchType = "imdb", imdb = imdb_id, api_key = api_key
     })
+    vlc.msg.dbg("[SubSource] IMDb search: " .. string.gsub(url, "api_key=[^&]+", "api_key=***"))
+    subSource.trackRequest()
     local r = client:get(url)
+    if r and (r.status == 401 or r.status == 403) then
+      setMessage(error_tag("Auth failed: Incorrect SubSource API key."))
+    end
     if r and r.status == 200 and r.body then
       local ok, parsed = pcall(json.decode, r.body, 1, true)
       if ok and parsed and parsed.data and type(parsed.data) == "table" then
@@ -2023,7 +2077,8 @@ function subSource.search(movie_title, languages_str, season, episode, imdb_id, 
       local params = { movieId = mid, api_key = api_key, page = tostring(page) }
       if full_lang_name then params["language"] = full_lang_name end
       local url = build_sorted_url(subSource.base_url .. "/subtitles", params)
-      vlc.msg.dbg("[SubSource] subtitles movieId=" .. mid .. " page=" .. page .. ": " .. url)
+      vlc.msg.dbg("[SubSource] subtitles movieId=" .. mid .. " page=" .. page .. ": " .. string.gsub(url, "api_key=[^&]+", "api_key=***"))
+      subSource.trackRequest()
       local r = client:get(url)
       if not r or r.status ~= 200 or not r.body then break end
       local ok, parsed = pcall(json.decode, r.body, 1, true)
@@ -2034,6 +2089,7 @@ function subSource.search(movie_title, languages_str, season, episode, imdb_id, 
       local total_pages = parsed.pagination and parsed.pagination.pages or 1
       if page >= total_pages or page >= max_pages then break end
       page = page + 1
+      vlc.misc.mwait(vlc.misc.mdate() + 250000)
     until false
     return all
   end
@@ -2140,12 +2196,13 @@ function subSource.downloadSubtitle(item)
   end
 
   local download_url = build_sorted_url(subSource.base_url .. "/subtitles/" .. tostring(sub_id) .. "/download", { api_key = api_key })
-  vlc.msg.dbg("[SubSource] Downloading subtitle ID " .. tostring(sub_id) .. " from " .. download_url)
+  vlc.msg.dbg("[SubSource] Downloading subtitle ID " .. tostring(sub_id) .. " from " .. string.gsub(download_url, "api_key=[^&]+", "api_key=***"))
 
   local client = Curl.new()
   client:set_timeout(30)
   client:set_retries(2)
 
+  subSource.trackRequest()
   local res = client:get(download_url, true) -- Pass true to prevent binary truncation
   if not res or res.status ~= 200 or not res.body then
     local status_str = res and tostring(res.status) or "no response"
@@ -2296,10 +2353,21 @@ function searchSubSourceDirect()
     return
   end
 
+  local sn_text = trim(input_table["seasonNumber"]:get_text())
+  if sn_text ~= "" and not tonumber(sn_text) then
+    setMessage(error_tag("Season must be a number"))
+    return
+  end
+  local ep_text = trim(input_table["episodeNumber"]:get_text())
+  if ep_text ~= "" and not tonumber(ep_text) then
+    setMessage(error_tag("Episode must be a number"))
+    return
+  end
+
   openSub.movie.title = trim(input_table["title"]:get_text())
   openSub.movie.year = trim(input_table["year"]:get_text())
-  openSub.movie.seasonNumber = tonumber(input_table["seasonNumber"]:get_text())
-  openSub.movie.episodeNumber = tonumber(input_table["episodeNumber"]:get_text())
+  openSub.movie.seasonNumber = tonumber(sn_text)
+  openSub.movie.episodeNumber = tonumber(ep_text)
   local imdbInput = trim(input_table["imdbId"]:get_text())
   openSub.movie.imdbId = extractIMDBId(imdbInput)
 
@@ -2326,11 +2394,19 @@ function searchSubSourceDirect()
 
   openSub.itemStore = results
   display_subtitles()
+  save_config() -- Save limits to config after search completes
 
   if #results > 0 then
-    setMessage(success_tag("SubSource search complete: " .. #results .. " result(s)"))
+    setMessage(success_tag("SubSource search complete: " .. #results .. " result(s)" .. subSource.getLimitsString()))
   else
-    setMessage(error_tag("No results found on SubSource."))
+    if subSource.getLimitsString() ~= "" then
+      -- Do not overwrite the error message if auth failed.
+      if not (input_table['message'] and input_table['message']:get_text():find("Auth failed")) then
+        setMessage(error_tag("No results found on SubSource." .. subSource.getLimitsString()))
+      end
+    else
+      setMessage(error_tag("No results found on SubSource."))
+    end
   end
 end
 
@@ -3590,9 +3666,9 @@ function apply_config()
     setSubsourceMessage(loading_tag("Validating SubSource Key..."))
     local ss_ok, ss_info = subSource.validateKey(subsource_key)
     if ss_ok then
-      setSubsourceMessage(success_tag("SubSource: API Key validated successfully!"))
+      setSubsourceMessage(success_tag("SubSource: API Key validated successfully!" .. subSource.getLimitsString()))
     else
-      setSubsourceMessage(error_tag("SubSource: " .. ss_info))
+      setSubsourceMessage(error_tag("SubSource: " .. ss_info .. subSource.getLimitsString()))
     end
   else
     setSubsourceMessage("")
@@ -4670,12 +4746,21 @@ function searchIMBD_v2()
   -- No IMDB ID provided, use standard name search
   openSub.lastSearchMethod = "name" -- Track that this is a name search
 
+  local sn_text = trim(input_table["seasonNumber"]:get_text())
+  if sn_text ~= "" and not tonumber(sn_text) then
+    setMessage(error_tag("Season must be a number"))
+    return
+  end
+  local ep_text = trim(input_table["episodeNumber"]:get_text())
+  if ep_text ~= "" and not tonumber(ep_text) then
+    setMessage(error_tag("Episode must be a number"))
+    return
+  end
+
   openSub.movie.title = trim(input_table["title"]:get_text())
   openSub.movie.year = trim(input_table["year"]:get_text())  -- Capture year from input
-  openSub.movie.seasonNumber = tonumber(
-    input_table["seasonNumber"]:get_text())
-  openSub.movie.episodeNumber = tonumber(
-    input_table["episodeNumber"]:get_text())
+  openSub.movie.seasonNumber = tonumber(sn_text)
+  openSub.movie.episodeNumber = tonumber(ep_text)
   openSub.movie.imdbId = nil  -- Clear IMDB ID for name searches
 
   -- Debug: check available languages
@@ -8779,27 +8864,28 @@ openSub.searchSubtitlesNewAPI = function()
     vlc.msg.err("[VLSub] 301 Redirect - URL parameters may not be sorted correctly")
     vlc.msg.err("[VLSub] URL was: " .. url)
     openSub.itemStore = "0"
-  elseif res and res.status == 401 then
-    -- Token expired or invalid, try to re-login
-    vlc.msg.dbg("[VLSub] Authentication failed, attempting re-login")
-    openSub.session.token = ""
-    openSub.session.token_expires = 0
-    if openSub.checkSession() then
-      -- Retry the search with new token
-      openSub.searchSubtitlesNewAPI()
+    elseif res and res.status == 401 then
+      -- Token expired or invalid, try to re-login
+      vlc.msg.dbg("[VLSub] Authentication failed, attempting re-login")
+      openSub.session.token = ""
+      openSub.session.token_expires = 0
+      if openSub.checkSession() then
+        -- Retry the search with new token
+        openSub.searchSubtitlesNewAPI()
+      else
+        openSub.itemStore = "0"
+        setMessage(error_tag("Auth failed: Incorrect OpenSubtitles credentials. Check config."))
+      end
+    elseif res and res.status then
+      vlc.msg.err("[VLSub] API request failed with status: " .. res.status)
+      if res.body then
+        vlc.msg.err("[VLSub] Error response: " .. res.body)
+      end
+      openSub.itemStore = "0"
     else
+      vlc.msg.err("[VLSub] API request failed - no response")
       openSub.itemStore = "0"
     end
-  elseif res and res.status then
-    vlc.msg.err("[VLSub] API request failed with status: " .. res.status)
-    if res.body then
-      vlc.msg.err("[VLSub] Error response: " .. res.body)
-    end
-    openSub.itemStore = "0"
-  else
-    vlc.msg.err("[VLSub] API request failed - no response")
-    openSub.itemStore = "0"
-  end
 
   -- SubSource Automatic Fallback Trigger
   local ss_key = trim(openSub.option.subsource_api_key or "")
@@ -8959,7 +9045,7 @@ openSub.searchSubtitlesByHashNewAPI = function()
             return
         else
             openSub.itemStore = {} -- Set to empty table
-            setMessage(error_tag(lang["mess_unauthorized"]))
+            setMessage(error_tag("Auth failed: Incorrect OpenSubtitles credentials. Check config."))
         end
     elseif res and res.status == 429 then
         -- Rate limiting error
