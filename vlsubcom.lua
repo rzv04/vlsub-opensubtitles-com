@@ -219,7 +219,7 @@ local options = {
     int_title = 'Title',
     int_season = 'TV Season',
     int_episode = 'TV Episode',
-    int_imdb = 'IMDB ID',
+    int_imdb = 'IMDB ID (Movies)',
     int_show_help = 'Help',
     int_show_conf = 'Config',
     int_dowload_sel = 'Download selected',
@@ -1743,6 +1743,12 @@ subSource.limits = {
   day = { max = 7200 }
 }
 
+subSource.paginationState = nil
+
+function clear_pagination_state()
+  subSource.paginationState = nil
+end
+
 function subSource.trackRequest()
   local now = os.time()
   if type(openSub.option.subSourceLimits) ~= "table" then
@@ -1931,14 +1937,37 @@ function subSource.convertResponse(parsed_data, default_title)
   return results
 end
 
-function subSource.search(movie_title, languages_str, season, episode, imdb_id, year, is_hash)
+function subSource.search(movie_title, languages_str, season, episode, imdb_id, year, is_hash, is_show_more)
   local api_key = trim(openSub.option.subsource_api_key or "")
   if api_key == "" then
     vlc.msg.dbg("[SubSource] Search skipped - no API key provided")
     return {}
   end
 
-  vlc.msg.dbg("[SubSource] Searching subtitles for title: " .. tostring(movie_title))
+  local state
+  if is_show_more and subSource.paginationState then
+    state = subSource.paginationState
+  else
+    state = {
+      target_movie_ids = {},
+      current_movie_idx = 1,
+      next_page = 1,
+      movie_title = movie_title,
+      languages_str = languages_str,
+      season = season,
+      episode = episode,
+      imdb_id = imdb_id,
+      year = year,
+      is_hash = is_hash,
+      accumulated_results = {},
+      has_more = false,
+      last_filtered_count = 0
+    }
+    subSource.paginationState = state
+  end
+
+  local season_num = state.season and tonumber(state.season)
+  local episode_num = state.episode and tonumber(state.episode)
 
   -- Language mapping from code to full name for SubSource API
   local lang_code_to_name = {
@@ -1964,157 +1993,115 @@ function subSource.search(movie_title, languages_str, season, episode, imdb_id, 
   }
 
   local full_lang_name = nil
-  if languages_str and languages_str ~= "" and languages_str ~= "all" then
-    local primary_lang = string.match(languages_str, "^([^,]+)") or languages_str
+  if state.languages_str and state.languages_str ~= "" and state.languages_str ~= "all" then
+    local primary_lang = string.match(state.languages_str, "^([^,]+)") or state.languages_str
     primary_lang = string.lower(primary_lang)
     full_lang_name = lang_code_to_name[primary_lang] or primary_lang
   end
-
-  local season_num = season and tonumber(season)
-  local episode_num = episode and tonumber(episode)
 
   local client = Curl.new()
   -- No headers: vlc.stream (HTTPS) converts them to URL params which SubSource rejects
   client:set_timeout(25)
   client:set_retries(2)
 
-  -- -----------------------------------------------------------------------
-  -- SubSource /subtitles requires movieId — releaseInfo alone returns empty.
-  -- The /movies/search response has a "season" field on each entry.
-  -- Strategy:
-  --   1. Get all movie entries for the title (paginate the movie search)
-  --   2. Find the entry whose entry.season matches the requested season
-  --   3. Fetch all subtitle pages for that movieId
-  --   4. Client-side filter for episode
-  -- -----------------------------------------------------------------------
+  if not is_show_more then
+    -- Collect all movie entries (SubSource may paginate movie results too)
+    local movie_entries = {}
 
-  -- Step 1: Collect all movie entries (SubSource may paginate movie results too)
-  local movie_entries = {}
-
-  local function fetch_movie_entries(query)
-    local url = build_sorted_url(subSource.base_url .. "/movies/search", {
-      searchType = "text", q = query, api_key = api_key
-    })
-    vlc.msg.dbg("[SubSource] Movie search: " .. string.gsub(url, "api_key=[^&]+", "api_key=***"))
-    subSource.trackRequest()
-    local r = client:get(url)
-    if r and (r.status == 401 or r.status == 403) then
-      setMessage(error_tag("Auth failed: Incorrect SubSource API key."))
-    end
-    if r and r.status == 200 and r.body then
-      vlc.msg.dbg("[SubSource] Movie search response: " .. string.sub(r.body, 1, 800))
-      local ok, parsed = pcall(json.decode, r.body, 1, true)
-      if ok and parsed and parsed.data and type(parsed.data) == "table" then
-        for _, entry in ipairs(parsed.data) do
-          vlc.msg.dbg("[SubSource] Movie entry: id=" .. tostring(entry.movieId or entry.id) .. " season=" .. tostring(entry.season) .. " title=" .. tostring(entry.title))
-          table.insert(movie_entries, entry)
-        end
-      end
-    end
-  end
-
-  if imdb_id and imdb_id ~= "" then
-    local url = build_sorted_url(subSource.base_url .. "/movies/search", {
-      searchType = "imdb", imdb = imdb_id, api_key = api_key
-    })
-    vlc.msg.dbg("[SubSource] IMDb search: " .. string.gsub(url, "api_key=[^&]+", "api_key=***"))
-    subSource.trackRequest()
-    local r = client:get(url)
-    if r and (r.status == 401 or r.status == 403) then
-      setMessage(error_tag("Auth failed: Incorrect SubSource API key."))
-    end
-    if r and r.status == 200 and r.body then
-      local ok, parsed = pcall(json.decode, r.body, 1, true)
-      if ok and parsed and parsed.data and type(parsed.data) == "table" then
-        for _, entry in ipairs(parsed.data) do
-          vlc.msg.dbg("[SubSource] IMDb movie entry: id=" .. tostring(entry.movieId or entry.id) .. " season=" .. tostring(entry.season))
-          table.insert(movie_entries, entry)
-        end
-      end
-    end
-  end
-
-  if #movie_entries == 0 and movie_title and movie_title ~= "" then
-    fetch_movie_entries(movie_title)
-  end
-
-  if #movie_entries == 0 then
-    vlc.msg.dbg("[SubSource] No movie entries found for: " .. tostring(movie_title))
-    return {}
-  end
-
-  -- Step 2: Pick the best matching movieId(s)
-  -- Prefer entry whose entry.season matches season_num; collect all matches
-  local target_movie_ids = {}
-
-  if season_num and season_num > 0 then
-    -- Try exact season match first
-    for _, entry in ipairs(movie_entries) do
-      local entry_season = tonumber(entry.season)
-      if entry_season and entry_season == season_num then
-        local mid = entry.movieId or entry.id
-        if mid then
-          vlc.msg.dbg("[SubSource] Season-matched movieId: " .. tostring(mid) .. " (season=" .. tostring(entry_season) .. ")")
-          table.insert(target_movie_ids, tostring(mid))
-        end
-      end
-    end
-  end
-
-  -- Fall back to all entries if no season match
-  if #target_movie_ids == 0 then
-    vlc.msg.dbg("[SubSource] No season-specific match, using all " .. #movie_entries .. " entries")
-    for _, entry in ipairs(movie_entries) do
-      local mid = entry.movieId or entry.id
-      if mid then table.insert(target_movie_ids, tostring(mid)) end
-    end
-  end
-
-  -- Step 3: Fetch subtitles for all target movieIds
-  local function fetch_subtitles_for_movie(mid)
-    local all = {}
-    local page = 1
-    local max_pages = 5
-    repeat
-      local params = { movieId = mid, api_key = api_key, page = tostring(page) }
-      if full_lang_name then params["language"] = full_lang_name end
-      local url = build_sorted_url(subSource.base_url .. "/subtitles", params)
-      vlc.msg.dbg("[SubSource] subtitles movieId=" .. mid .. " page=" .. page .. ": " .. string.gsub(url, "api_key=[^&]+", "api_key=***"))
+    local function fetch_movie_entries(query)
+      local url = build_sorted_url(subSource.base_url .. "/movies/search", {
+        searchType = "text", q = query, api_key = api_key
+      })
+      vlc.msg.dbg("[SubSource] Movie search: " .. string.gsub(url, "api_key=[^&]+", "api_key=***"))
       subSource.trackRequest()
       local r = client:get(url)
-      if not r or r.status ~= 200 or not r.body then break end
-      local ok, parsed = pcall(json.decode, r.body, 1, true)
-      if not ok or not parsed then break end
-      local items = subSource.convertResponse(parsed, movie_title)
-      for _, v in ipairs(items) do table.insert(all, v) end
-      vlc.msg.dbg("[SubSource] movieId=" .. mid .. " page=" .. page .. " → " .. #items .. " items (total api: " .. tostring(parsed.pagination and parsed.pagination.total) .. ")")
-      local total_pages = parsed.pagination and parsed.pagination.pages or 1
-      if page >= total_pages or page >= max_pages then break end
-      page = page + 1
-      vlc.misc.mwait(vlc.misc.mdate() + 250000)
-    until false
-    return all
+      if r and (r.status == 401 or r.status == 403) then
+        setMessage(error_tag("Auth failed: Incorrect SubSource API key."))
+      end
+      if r and r.status == 200 and r.body then
+        vlc.msg.dbg("[SubSource] Movie search response: " .. string.sub(r.body, 1, 800))
+        local ok, parsed = pcall(json.decode, r.body, 1, true)
+        if ok and parsed and parsed.data and type(parsed.data) == "table" then
+          for _, entry in ipairs(parsed.data) do
+            vlc.msg.dbg("[SubSource] Movie entry: id=" .. tostring(entry.movieId or entry.id) .. " season=" .. tostring(entry.season) .. " title=" .. tostring(entry.title))
+            table.insert(movie_entries, entry)
+          end
+        end
+      end
+    end
+
+    if state.imdb_id and state.imdb_id ~= "" then
+      local url = build_sorted_url(subSource.base_url .. "/movies/search", {
+        searchType = "imdb", imdb = state.imdb_id, api_key = api_key
+      })
+      vlc.msg.dbg("[SubSource] IMDb search: " .. string.gsub(url, "api_key=[^&]+", "api_key=***"))
+      subSource.trackRequest()
+      local r = client:get(url)
+      if r and (r.status == 401 or r.status == 403) then
+        setMessage(error_tag("Auth failed: Incorrect SubSource API key."))
+      end
+      if r and r.status == 200 and r.body then
+        local ok, parsed = pcall(json.decode, r.body, 1, true)
+        if ok and parsed and parsed.data and type(parsed.data) == "table" then
+          for _, entry in ipairs(parsed.data) do
+            vlc.msg.dbg("[SubSource] IMDb movie entry: id=" .. tostring(entry.movieId or entry.id) .. " season=" .. tostring(entry.season))
+            table.insert(movie_entries, entry)
+          end
+        end
+      end
+    end
+
+    if #movie_entries == 0 and state.movie_title and state.movie_title ~= "" then
+      fetch_movie_entries(state.movie_title)
+    end
+
+    if #movie_entries == 0 then
+      vlc.msg.dbg("[SubSource] No movie entries found for: " .. tostring(state.movie_title))
+      state.has_more = false
+      return {}
+    end
+
+    -- Step 2: Pick the best matching movieId(s)
+    local target_movie_ids = {}
+    if season_num and season_num > 0 then
+      -- Try exact season match first
+      for _, entry in ipairs(movie_entries) do
+        local entry_season = tonumber(entry.season)
+        if entry_season and entry_season == season_num then
+          local mid = entry.movieId or entry.id
+          if mid then
+            vlc.msg.dbg("[SubSource] Season-matched movieId: " .. tostring(mid) .. " (season=" .. tostring(entry_season) .. ")")
+            table.insert(target_movie_ids, tostring(mid))
+          end
+        end
+      end
+    end
+
+    -- Fall back to all entries if no season match
+    if #target_movie_ids == 0 then
+      vlc.msg.dbg("[SubSource] No season-specific match, using all " .. #movie_entries .. " entries")
+      for _, entry in ipairs(movie_entries) do
+        local mid = entry.movieId or entry.id
+        if mid then table.insert(target_movie_ids, tostring(mid)) end
+      end
+    end
+    state.target_movie_ids = target_movie_ids
   end
 
-  local all_converted = {}
-  for _, mid in ipairs(target_movie_ids) do
-    local subs = fetch_subtitles_for_movie(mid)
-    for _, v in ipairs(subs) do table.insert(all_converted, v) end
-  end
+  local new_matches = 0
+  state.has_more = false
 
-  if #all_converted == 0 then
-    vlc.msg.dbg("[SubSource] No subtitles found")
-    return {}
-  end
-
-  -- Client-side season/episode filter
-  local converted = all_converted
-  if season_num and season_num > 0 then
+  -- Helper function to filter accumulated results
+  local function get_filtered_results(results_list)
+    if #results_list == 0 then return {} end
+    if not season_num or season_num <= 0 then
+      return results_list
+    end
     local filtered = {}
     local s_padded = string.format("%02d", season_num)
     local e_padded = episode_num and episode_num > 0 and string.format("%02d", episode_num) or nil
 
-    for _, item in ipairs(all_converted) do
+    for _, item in ipairs(results_list) do
       local fname = string.upper(item.SubFileName or "")
       local matched = false
 
@@ -2137,22 +2124,84 @@ function subSource.search(movie_title, languages_str, season, episode, imdb_id, 
 
       if matched then table.insert(filtered, item) end
     end
-    vlc.msg.dbg("[SubSource] After S" .. s_padded .. (e_padded and ("E"..e_padded) or "") .. " filter: " .. #filtered .. "/" .. #all_converted)
+
     -- If episode filter removed everything, fall back to season-level results (season packs)
     if #filtered == 0 and e_padded then
-      vlc.msg.dbg("[SubSource] Episode filter zeroed results, returning season-level matches")
-      for _, item in ipairs(all_converted) do
+      for _, item in ipairs(results_list) do
         local fname = string.upper(item.SubFileName or "")
         if string.find(fname, string.format("S%s", s_padded), 1, true) then
           table.insert(filtered, item)
         end
       end
     end
-    converted = filtered
+    return filtered
   end
 
-  vlc.msg.dbg("[SubSource] Search returned " .. #converted .. " subtitles")
-  return converted
+  -- Step 3: Fetch subtitles for target movieIds
+  while state.current_movie_idx <= #state.target_movie_ids do
+    local mid = state.target_movie_ids[state.current_movie_idx]
+    local params = { movieId = mid, api_key = api_key, page = tostring(state.next_page) }
+    if full_lang_name then params["language"] = full_lang_name end
+    local url = build_sorted_url(subSource.base_url .. "/subtitles", params)
+    vlc.msg.dbg("[SubSource] subtitles movieId=" .. mid .. " page=" .. state.next_page .. ": " .. string.gsub(url, "api_key=[^&]+", "api_key=***"))
+    
+    subSource.trackRequest()
+    local r = client:get(url)
+    if not r or r.status ~= 200 or not r.body then break end
+    
+    local ok, parsed = pcall(json.decode, r.body, 1, true)
+    if not ok or not parsed then break end
+    
+    local items = subSource.convertResponse(parsed, state.movie_title)
+    for _, v in ipairs(items) do
+      table.insert(state.accumulated_results, v)
+    end
+    vlc.msg.dbg("[SubSource] movieId=" .. mid .. " page=" .. state.next_page .. " → " .. #items .. " items (total api: " .. tostring(parsed.pagination and parsed.pagination.total) .. ")")
+    
+    local filtered = get_filtered_results(state.accumulated_results)
+    new_matches = #filtered - state.last_filtered_count
+    
+    local total_pages = parsed.pagination and (parsed.pagination.pages or (parsed.pagination.total and math.ceil(parsed.pagination.total / 20))) or 1
+    
+    -- Increment page/movie idx
+    if state.next_page >= total_pages then
+      state.current_movie_idx = state.current_movie_idx + 1
+      state.next_page = 1
+    else
+      state.next_page = state.next_page + 1
+    end
+    
+    -- Update has_more
+    if state.current_movie_idx <= #state.target_movie_ids then
+      state.has_more = true
+    else
+      state.has_more = false
+    end
+
+    if new_matches >= 20 then
+      break
+    end
+
+    -- Delay between loops
+    if state.current_movie_idx <= #state.target_movie_ids then
+      if vlc.misc and vlc.misc.mwait and vlc.misc.mdate then
+        vlc.misc.mwait(vlc.misc.mdate() + 250000)
+      else
+        local delay_start = os.clock()
+        while (os.clock() - delay_start) < 0.25 do end
+      end
+    end
+  end
+
+  local final_filtered = get_filtered_results(state.accumulated_results)
+  local new_filtered = {}
+  for i = state.last_filtered_count + 1, #final_filtered do
+    table.insert(new_filtered, final_filtered[i])
+  end
+  state.last_filtered_count = #final_filtered
+
+  vlc.msg.dbg("[SubSource] Search page loop finished. New matching: " .. #new_filtered .. " Total matching: " .. #final_filtered .. " has_more=" .. tostring(state.has_more))
+  return new_filtered
 end
 
 -- Score an SRT filename against requested season/episode (higher = better match)
@@ -2209,6 +2258,7 @@ function subSource.downloadSubtitle(item)
   if not res or res.status ~= 200 or not res.body then
     local status_str = res and tostring(res.status) or "no response"
     setMessage(error_tag("SubSource download failed (HTTP " .. status_str .. ")"))
+    save_config()
     return false
   end
 
@@ -2242,6 +2292,7 @@ function subSource.downloadSubtitle(item)
     -- Plain SRT/text content
     local success = openSub.saveAndLoadSubtitle(raw_body, item)
     if success then setMessage(success_tag("Subtitle downloaded from SubSource!")) end
+    save_config()
     return success
   end
 
@@ -2342,6 +2393,7 @@ function subSource.downloadSubtitle(item)
   if success then
     setMessage(success_tag("Subtitle downloaded from SubSource! (" .. #srt_files .. " file(s) in ZIP, best match selected)"))
   end
+  save_config()
   return success
 end
 
@@ -2412,6 +2464,52 @@ function searchSubSourceDirect()
   end
 end
 
+function show_more_action()
+  local is_fresh = (subSource.paginationState == nil)
+  
+  if not is_fresh and not subSource.paginationState.has_more then
+    setMessage(error_tag("No additional SubSource results found."))
+    return
+  end
+
+  setMessage(loading_tag("Fetching more results..."))
+
+  local langs = getSelectedLanguages()
+
+  -- Fetch next page (or start fresh)
+  local results = subSource.search(
+    openSub.movie.title,
+    langs,
+    openSub.movie.seasonNumber,
+    openSub.movie.episodeNumber,
+    openSub.movie.imdbId,
+    openSub.movie.year,
+    false,
+    not is_fresh
+  )
+  
+  if results and #results > 0 then
+    if not openSub.itemStore or type(openSub.itemStore) ~= "table" then
+      openSub.itemStore = {}
+    end
+    for _, item in ipairs(results) do
+      table.insert(openSub.itemStore, item)
+    end
+    
+    display_subtitles()
+
+    if subSource.paginationState and not subSource.paginationState.has_more then
+      setMessage(success_tag("Appended " .. #results .. " results (All SubSource pages loaded!)"))
+    else
+      setMessage(success_tag("Appended " .. #results .. " results."))
+    end
+  else
+    setMessage(error_tag("No additional SubSource results found."))
+  end
+
+  -- Save limits
+  save_config()
+end
 
 -- Modified interface_main function - update the help button to pass window context
 function interface_main()
@@ -2475,6 +2573,9 @@ function interface_main()
 
   dlg:add_button(
     "🔗 Link", open_subtitle_link, 2, 11, 1, 1)
+
+  input_table['show_more'] = dlg:add_button(
+    "➕ Show More (SubSource)", show_more_action, 3, 11, 2, 1)
 
   dlg:add_button(
     "⚙️ Config", show_conf, 5, 11, 1, 1)
@@ -2950,6 +3051,10 @@ end
 function display_subtitles()
   local mainlist = input_table["mainlist"]
   mainlist:clear()
+
+  if openSub.lastSearchMethod ~= "subsource" and openSub.lastSearchMethod ~= "subsource_fallback" then
+    clear_pagination_state()
+  end
 
   -- Safe check for no results - FIXED to avoid string/number comparison error
   local hasNoResults = false
@@ -8895,30 +9000,6 @@ openSub.searchSubtitlesNewAPI = function()
       vlc.msg.err("[VLSub] API request failed - no response")
       openSub.itemStore = "0"
     end
-
-  -- SubSource Automatic Fallback Trigger
-  local ss_key = trim(openSub.option.subsource_api_key or "")
-  local hasNoOSResults = (not openSub.itemStore or openSub.itemStore == "0" or (type(openSub.itemStore) == "table" and #openSub.itemStore == 0))
-  local is429 = (res and res.status == 429)
-
-  if (hasNoOSResults or is429) and ss_key ~= "" then
-    vlc.msg.dbg("[VLSub] OpenSubtitles returned 0 results or 429 rate limit. Triggering SubSource automatic fallback.")
-    setMessage(loading_tag("OpenSubtitles (0 results/429) -> Searching SubSource..."))
-    local ss_results = subSource.search(
-      openSub.movie.title,
-      openSub.movie.sublanguageid,
-      openSub.movie.seasonNumber,
-      openSub.movie.episodeNumber,
-      openSub.movie.imdbId,
-      openSub.movie.year,
-      false
-    )
-    if #ss_results > 0 then
-      openSub.itemStore = ss_results
-      openSub.lastSearchMethod = "subsource_fallback"
-      setMessage(success_tag("Found " .. #ss_results .. " subtitle(s) on SubSource!"))
-    end
-  end
 end
 
 -- Updated searchSubtitlesByHashNewAPI function with sorted parameters
