@@ -2690,7 +2690,7 @@ if (-not (Test-Path $audio_wav)) {
     exit
 }
 
-Set-Content -Path $status_file -Value "Transcribing..."
+Set-Content -Path $status_file -Value "Transcribing...You may play the video."
 Start-Process -FilePath $whisper_exe -ArgumentList "-m `"$model_bin`" -f `"$audio_wav`" -osrt" -RedirectStandardOutput "$srt_out.live" -Wait -WindowStyle Hidden
 
 Set-Content -Path $status_file -Value "Done!"
