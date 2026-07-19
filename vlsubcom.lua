@@ -2673,18 +2673,53 @@ Function Monitor-Process {
 
 Set-Content -Path $status_file -Value "Checking dependencies..."
 
-if (-not (Test-Path $whisper_exe)) {
-    Set-Content -Path $status_file -Value "Downloading Whisper..."
+Function Download-FileWithProgress {
+    param($url, $destination, $label)
+    $tmpDest = "$destination.tmp"
     $wc = New-Object System.Net.WebClient
-    $wc.DownloadFile("https://github.com/ggerganov/whisper.cpp/releases/download/v1.5.4/whisper-bin-x64.zip", "$ai_dir\whisper-bin-x64.zip")
+    try {
+        $stream = $wc.OpenRead($url)
+        $totalSize = [int]$wc.ResponseHeaders["Content-Length"]
+        $fileStream = [System.IO.File]::Create($tmpDest)
+        $buffer = New-Object byte[] 8192
+        $read = 0
+        $downloaded = 0
+        $lastPercent = -1
+        while (($read = $stream.Read($buffer, 0, $buffer.Length)) -gt 0) {
+            $fileStream.Write($buffer, 0, $read)
+            $downloaded += $read
+            if ($totalSize -gt 0) {
+                $percent = [math]::Round(($downloaded / $totalSize) * 100)
+                if ($percent -ne $lastPercent) {
+                    Set-Content -Path $status_file -Value "$label $percent%%"
+                    $lastPercent = $percent
+                }
+            }
+            if ((Get-Process -Name vlc -ErrorAction SilentlyContinue) -eq $null -or (Test-Path $abort_flag)) {
+                $fileStream.Close()
+                $stream.Close()
+                Remove-Item $tmpDest -Force -ErrorAction SilentlyContinue
+                exit
+            }
+        }
+        $fileStream.Close()
+        $stream.Close()
+        if (Test-Path $destination) { Remove-Item $destination -Force }
+        Rename-Item -Path $tmpDest -NewName (Split-Path $destination -Leaf) -Force
+    } catch {
+        Set-Content -Path $status_file -Value "Error downloading $label"
+        exit
+    }
+}
+
+if (-not (Test-Path $whisper_exe)) {
+    Download-FileWithProgress -url "https://github.com/ggerganov/whisper.cpp/releases/download/v1.5.4/whisper-bin-x64.zip" -destination "$ai_dir\whisper-bin-x64.zip" -label "Downloading Whisper..."
     Set-Content -Path $status_file -Value "Extracting Whisper..."
     Expand-Archive -Force -Path "$ai_dir\whisper-bin-x64.zip" -DestinationPath $ai_dir
 }
 
 if (-not (Test-Path $model_bin)) {
-    Set-Content -Path $status_file -Value "Downloading Model..."
-    $wc = New-Object System.Net.WebClient
-    $wc.DownloadFile("https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-%s.bin", $model_bin)
+    Download-FileWithProgress -url "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-%s.bin" -destination $model_bin -label "Downloading Model..."
 }
 
 Set-Content -Path $status_file -Value "Extracting audio (~30s)..."
