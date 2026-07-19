@@ -2628,6 +2628,9 @@ function ai_start_transcription(model_index, status_label)
       ai_is_running = false
       return
   end
+  
+  -- Hint to user on how to safely abort
+  vlc.osd.message("AI Transcription initiated. To abort, press Stop (■).", 2, "top", 6000000)
 
   -- Write the background PowerShell script
   local f = io.open(ps1_file, "w")
@@ -2797,7 +2800,7 @@ Set-Content -Path $done_flag -Value "DONE"
   -- Seamless handoff
   if ai_file_exists(srt_out) then
       add_sub(srt_out)
-      vlc.osd.message("AI Transcription Complete! Native subtitles loaded.", 1, "bottom", 4000000)
+      vlc.osd.message("AI Transcription Complete! Native subtitles loaded.", 1, "top-right", 4000000)
       if input_table and input_table['ai_status'] then
           input_table['ai_status']:set_text("Completed!")
       end
@@ -2808,21 +2811,6 @@ Set-Content -Path $done_flag -Value "DONE"
   os.remove(done_flag)
   os.remove(ps1_file)
   os.remove(srt_out .. ".live")
-  os.remove(abort_flag)
-end
-
-function ai_abort_proxy()
-  local abort_flag = openSub.conf.dirPath .. slash .. "vlsub_ai" .. slash .. "abort_flag.txt"
-  local f = io.open(abort_flag, "w")
-  if f then
-      f:write("ABORT")
-      f:close()
-  end
-  ai_is_running = false
-  if input_table and input_table['ai_status'] then
-      input_table['ai_status']:set_text("Status: Aborted")
-  end
-  vlc.osd.message("AI Transcription Aborted.", 1, "top-right", 3000000)
 end
 
 function ai_start_transcription_proxy()
@@ -2865,9 +2853,8 @@ function interface_main()
   input_table['ai_model'] = dlg:add_dropdown(6, 4, 1, 1)
   input_table['ai_model']:add_value("tiny.en", 1)
   input_table['ai_model']:add_value("base.en", 2)
-  input_table['ai_start'] = dlg:add_button("🎙️ Transcribe", ai_start_transcription_proxy, 5, 5, 1, 1)
-  input_table['ai_abort'] = dlg:add_button("🛑 Abort", ai_abort_proxy, 6, 5, 1, 1)
-  input_table['ai_status'] = dlg:add_label("Ready", 5, 6, 2, 1)
+  input_table['ai_start'] = dlg:add_button("🎙️ Transcribe", ai_start_transcription_proxy, 6, 5, 1, 1)
+  input_table['ai_status'] = dlg:add_label("Ready", 6, 6, 1, 1)
 
   -- Row 4: Language selection
   dlg:add_label(lang["int_default_lang"]..":", 1, 4, 1, 1)
