@@ -226,6 +226,7 @@ local options = {
     int_close = 'Close',
     int_ok = 'Ok',
     int_save = 'Save',
+    int_here = 'Here',
     int_cancel = 'Cancel',
     int_bool_true = 'Yes',
     int_bool_false = 'No',
@@ -243,6 +244,7 @@ local options = {
     int_remove_tag = 'Remove tags',
     int_use_curl = 'Use curl (<a href="https://github.com/opensubtitles/vlsub-opensubtitles-com/wiki/VLC-Extension-Development-FAQ:-Networking-and-Header-Limitations">info</a>)',
     int_vlsub_work_dir = 'VLSub working directory',
+    int_subsource_api_key_info = 'You can find your SubSource API Key ',
     int_os_username = 'OpenSubtitles.com Username',
     int_os_password = 'OpenSubtitles.com Password',
     int_subsource_api_key = 'SubSource API Key (Optional)',
@@ -2512,76 +2514,83 @@ function interface_config()
   input_table['subsource_api_key'] = dlg:add_text_input(
     type(openSub.option.subsource_api_key) == "string"
     and openSub.option.subsource_api_key or "", 2, 3, 2, 1)
+  
+  -- Row 4: SubSource API Key Info
+  local info_text = (lang["int_subsource_api_key_info"] or "You can find your SubSource API Key ")
+    .. "<a href='https://subsource.net/dashboard/profile'>"
+    .. string.lower(lang["int_here"] or "here")
+    .. "</a>."
+  dlg:add_label(info_text, 1, 4, 4, 1)
 
-  -- Row 4: Default primary language
-  dlg:add_label(lang["int_default_lang"]..":", 1, 4, 2, 1)
-  input_table['default_language'] = dlg:add_dropdown(3, 4, 1, 1)
+  -- Row 5: Default primary language
+  dlg:add_label(lang["int_default_lang"]..":", 1, 5, 2, 1)
+  input_table['default_language'] = dlg:add_dropdown(3, 5, 1, 1)
 
-  -- Row 5: Default secondary language
-  dlg:add_label(lang["int_second_lang"]..":", 1, 5, 2, 1)
-  input_table['default_language2'] = dlg:add_dropdown(3, 5, 1, 1)
+  -- Row 6: Default secondary language
+  dlg:add_label(lang["int_second_lang"]..":", 1, 6, 2, 1)
+  input_table['default_language2'] = dlg:add_dropdown(3, 6, 1, 1)
 
-  -- Row 6: Default third language
-  dlg:add_label(lang["int_third_lang"]..":", 1, 6, 2, 1)
-  input_table['default_language3'] = dlg:add_dropdown(3, 6, 1, 1)
+  -- Row 7: Default third language
+  dlg:add_label(lang["int_third_lang"]..":", 1, 7, 2, 1)
+  input_table['default_language3'] = dlg:add_dropdown(3, 7, 1, 1)
 
-  -- Row 7: Download behavior
-  dlg:add_label(lang["int_dowload_behav"]..":", 1, 7, 2, 1)
-  input_table['downloadBehaviour'] = dlg:add_dropdown(3, 7, 1, 1)
+  -- Row 8: Download behavior
+  dlg:add_label(lang["int_dowload_behav"]..":", 1, 8, 2, 1)
+  input_table['downloadBehaviour'] = dlg:add_dropdown(3, 8, 1, 1)
 
-  -- Row 8: Display language code
-  dlg:add_label(lang["int_display_code"]..":", 1, 8, 2, 1)
-  input_table['langExt'] = dlg:add_dropdown(3, 8, 1, 1)
+  -- Row 9: Display language code
+  dlg:add_label(lang["int_display_code"]..":", 1, 9, 2, 1)
+  input_table['langExt'] = dlg:add_dropdown(3, 9, 1, 1)
 
-  -- Row 9: Remove tags
-  dlg:add_label(lang["int_remove_tag"]..":", 1, 9, 2, 1)
-  input_table['removeTag'] = dlg:add_dropdown(3, 9, 1, 1)
+  -- Row 10: Remove tags
+  dlg:add_label(lang["int_remove_tag"]..":", 1, 10, 2, 1)
+  input_table['removeTag'] = dlg:add_dropdown(3, 10, 1, 1)
 
-  -- Row 10: Working directory
+  -- Row 11: Working directory
   if openSub.conf.dirPath then
     if openSub.conf.os == "lin" then
-      dlg:add_label(lang["int_vlsub_work_dir"], 1, 10, 2, 1)
+      dlg:add_label(lang["int_vlsub_work_dir"], 1, 11, 2, 1)
     elseif openSub.conf.os == "win" then
       dlg:add_label(
         "<a href='file:///"..openSub.conf.dirPath.."'>"..
-        lang["int_vlsub_work_dir"].."</a>", 1, 10, 2, 1)
+        lang["int_vlsub_work_dir"].."</a>", 1, 11, 2, 1)
     else
       dlg:add_label(
         "<a href='"..openSub.conf.dirPath.."'>"..
-        lang["int_vlsub_work_dir"].."</a>", 1, 10, 2, 1)
+        lang["int_vlsub_work_dir"].."</a>", 1, 11, 2, 1)
     end
   else
-    dlg:add_label(lang["int_vlsub_work_dir"], 1, 10, 2, 1)
+    dlg:add_label(lang["int_vlsub_work_dir"], 1, 11, 2, 1)
   end
 
   input_table['dir_path'] = dlg:add_text_input(
-    openSub.conf.dirPath, 2, 10, 2, 1)
+    openSub.conf.dirPath, 2, 11, 2, 1)
 
-  -- Row 11: OpenSubtitles status message
+  -- Row 12: OpenSubtitles status message
   input_table['message'] = nil
-  input_table['message'] = dlg:add_label('', 1, 11, 4, 1)
+  input_table['message'] = dlg:add_label('', 1, 12, 4, 1)
 
-  -- Row 12: SubSource status message
+  -- Row 13: SubSource status message
   input_table['subsource_message'] = nil
-  input_table['subsource_message'] = dlg:add_label('', 1, 12, 4, 1)
+  input_table['subsource_message'] = dlg:add_label('', 1, 13, 4, 1)
 
-  -- Row 13: Action buttons
+  -- Row 14: Action buttons
   dlg:add_button(
     "💾 " .. lang["int_save"],
-    apply_config, 1, 13, 1, 1)
+    apply_config, 1, 14, 1, 1)
 
   dlg:add_button(
     "❓ " .. lang["int_help"],
     function() show_help("config") end,
-    2, 13, 1, 1)
+    2, 14, 1, 1)
 
   dlg:add_button(
     "🔄 Check Updates",
-    function() check_for_updates(true) end, 3, 13, 1, 1)
+    function() check_for_updates(true) end, 3, 14, 1, 1)
 
   dlg:add_button(
     "❌ " .. lang["int_close"],
-    show_main, 4, 13, 1, 1)
+    show_main, 4, 14, 1, 1)
 
   -- Setup dropdown values for existing dropdowns
   input_table['langExt']:add_value(
