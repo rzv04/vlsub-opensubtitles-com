@@ -84,6 +84,7 @@ yay -S vlsub-opensubtitles-com-git
 - **OpenSubtitles.com account** ([free registration](https://www.opensubtitles.com/newuser))
 - **Internet connection** for searching and downloading
 - **curl** command-line tool (for downloads - usually pre-installed)
+- **unzip** command-line tool (required for Linux/macOS users for SubSource extraction - usually pre-installed)
 
 ## 🎬 Usage
 

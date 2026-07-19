@@ -2297,10 +2297,14 @@ function subSource.downloadSubtitle(item)
   end
 
   -- ---- ZIP handling ----
-  -- Save ZIP to a temp file, extract with PowerShell, pick best SRT
-  local tmp_dir = os.getenv("TEMP") or os.getenv("TMP") or "C:\\Temp"
-  local zip_path = tmp_dir .. "\\vlsub_subsource_" .. tostring(sub_id) .. ".zip"
-  local extract_dir = tmp_dir .. "\\vlsub_subsource_" .. tostring(sub_id)
+  local is_windows = (package.config:sub(1,1) == "\\")
+  
+  -- Save ZIP to a temp file, extract, pick best SRT
+  local tmp_dir = is_windows and (os.getenv("TEMP") or os.getenv("TMP") or "C:\\Temp") or "/tmp"
+  local path_sep = is_windows and "\\" or "/"
+  
+  local zip_path = tmp_dir .. path_sep .. "vlsub_subsource_" .. tostring(sub_id) .. ".zip"
+  local extract_dir = tmp_dir .. path_sep .. "vlsub_subsource_" .. tostring(sub_id)
 
   vlc.msg.dbg("[SubSource] Saving ZIP to: " .. zip_path)
   local zf = io.open(zip_path, "wb")
@@ -2312,23 +2316,28 @@ function subSource.downloadSubtitle(item)
   zf:flush()
   zf:close()
 
-  -- Extract ZIP using PowerShell
-  local ps_cmd = string.format(
-    'powershell -NoProfile -Command "Expand-Archive -LiteralPath \'%s\' -DestinationPath \'%s\' -Force"',
-    zip_path, extract_dir
-  )
-  vlc.msg.dbg("[SubSource] Extracting ZIP: " .. ps_cmd)
-  local ok_extract = os.execute(ps_cmd)
+  -- Extract ZIP
+  local ext_cmd = ""
+  if is_windows then
+    ext_cmd = string.format('powershell -NoProfile -Command "Expand-Archive -LiteralPath \'%s\' -DestinationPath \'%s\' -Force"', zip_path, extract_dir)
+  else
+    ext_cmd = string.format("unzip -o '%s' -d '%s' > /dev/null 2>&1", zip_path, extract_dir)
+  end
+  vlc.msg.dbg("[SubSource] Extracting ZIP: " .. ext_cmd)
+  local ok_extract = os.execute(ext_cmd)
   if not ok_extract then
     setMessage(error_tag("Failed to extract SubSource ZIP"))
     return false
   end
 
-  -- List extracted SRT files using PowerShell
-  local list_cmd = string.format(
-    'powershell -NoProfile -Command "Get-ChildItem -Path \'%s\' -Recurse -Include *.srt,*.sub,*.ass | Select-Object -ExpandProperty FullName"',
-    extract_dir
-  )
+  -- List extracted SRT files
+  local list_cmd = ""
+  if is_windows then
+    list_cmd = string.format('powershell -NoProfile -Command "Get-ChildItem -Path \'%s\' -Recurse -Include *.srt,*.sub,*.ass | Select-Object -ExpandProperty FullName"', extract_dir)
+  else
+    list_cmd = string.format("find '%s' -type f \\( -iname \"*.srt\" -o -iname \"*.sub\" -o -iname \"*.ass\" \\)", extract_dir)
+  end
+  
   local pipe = io.popen(list_cmd)
   local srt_files = {}
   if pipe then
@@ -2843,10 +2852,13 @@ function should_auto_search()
        (guessit.season and guessit.episode) then
       has_useful_guessit_data = true
       if openSub.option.debugLogging then
+        local g_title = type(guessit.title) == "table" and (guessit.title[1] or "") or tostring(guessit.title or "none")
+        local g_season = type(guessit.season) == "table" and (guessit.season[1] or "") or tostring(guessit.season or "none")
+        local g_episode = type(guessit.episode) == "table" and (guessit.episode[1] or "") or tostring(guessit.episode or "none")
         vlc.msg.dbg("[VLSub] GuessIt provided useful data - title: " ..
-                    (guessit.title or "none") .. ", season: " ..
-                    (guessit.season or "none") .. ", episode: " ..
-                    (guessit.episode or "none"))
+                    g_title .. ", season: " ..
+                    g_season .. ", episode: " ..
+                    g_episode)
       end
     end
   end
@@ -4295,6 +4307,28 @@ getFileInfo = function()
         '^([^/]+)%.([^%.]+)$')
     end
 
+    -- Check if item:name() or item:metas() has a richer display name (critical for IPTV streams like 44920.mkv)
+    local item_name = item.name and item:name()
+    local metas = item.metas and item:metas()
+    local meta_title = metas and (metas['title'] or metas['filename'])
+
+    if item_name and item_name ~= "" then
+      if string.match(file.name, "^%d+$") or string.find(item_name, "%.") or string.find(item_name, " ") then
+        file.completeName = item_name
+        local parsed_n = string.match(item_name, '^([^/]-)%.?([^%.]*)$')
+        if parsed_n and parsed_n ~= "" then
+          file.name = parsed_n
+        else
+          file.name = item_name
+        end
+      end
+    elseif meta_title and meta_title ~= "" then
+      if string.match(file.name, "^%d+$") then
+        file.completeName = meta_title
+        file.name = meta_title
+      end
+    end
+
     file.hasInput = true;
     file.cleanName = string.gsub(
       file.name,
@@ -4365,12 +4399,20 @@ getMovieInfo = function()
     end
   end
 
-  if infoString == '' then
-    -- read from metadata
+  -- If cleanName is empty or a numeric IPTV stream ID (e.g., "477590"), try VLC item metadata title
+  if (infoString == '' or string.match(infoString, "^%d+$")) and vlc.input and vlc.input.item() then
     local metas = vlc.input.item():metas()
-    if metas['title'] ~= nil then
+    if metas and metas['title'] and metas['title'] ~= '' then
       infoString = metas['title']
     end
+  end
+
+  local function get_str_val(val)
+    if val == nil then return "" end
+    if type(val) == "table" then
+      return tostring(val[1] or "")
+    end
+    return tostring(val)
   end
 
   -- Try to use GuessIt data first if available
@@ -4378,7 +4420,7 @@ getMovieInfo = function()
     local guessit = openSub.file.guessit_data
 
     if guessit.title then
-      openSub.movie.title = guessit.title
+      openSub.movie.title = get_str_val(guessit.title)
     else
       -- Fallback to parsed title from filename
       openSub.movie.title = infoString
@@ -4386,20 +4428,20 @@ getMovieInfo = function()
 
     -- Set year from GuessIt
     if guessit.year then
-      openSub.movie.year = tostring(guessit.year)
+      openSub.movie.year = get_str_val(guessit.year)
     else
       openSub.movie.year = ""
     end
 
     -- Use GuessIt season/episode if available
     if guessit.season then
-      openSub.movie.seasonNumber = tostring(guessit.season)
+      openSub.movie.seasonNumber = get_str_val(guessit.season)
     else
       openSub.movie.seasonNumber = ""
     end
 
     if guessit.episode then
-      openSub.movie.episodeNumber = tostring(guessit.episode)
+      openSub.movie.episodeNumber = get_str_val(guessit.episode)
     else
       openSub.movie.episodeNumber = ""
     end

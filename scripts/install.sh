@@ -61,6 +61,43 @@ detect_platform() {
     esac
 }
 
+# Check for unzip (required for SubSource extraction on Linux/macOS)
+check_unzip() {
+    if [ "$PLATFORM" = "Windows" ]; then
+        return
+    fi
+    
+    echo "Checking for unzip utility..."
+    if command -v unzip &> /dev/null; then
+        printf "${GREEN}✓ unzip found${NC}\n"
+    else
+        printf "${YELLOW}⚠ unzip not found.${NC}\n"
+        if [ "$PLATFORM" = "Linux" ]; then
+            echo "Attempting to install unzip..."
+            if command -v apt &> /dev/null; then
+                sudo apt update && sudo apt install -y unzip
+            elif command -v dnf &> /dev/null; then
+                sudo dnf install -y unzip
+            elif command -v pacman &> /dev/null; then
+                sudo pacman -S --noconfirm unzip
+            else
+                echo "Please install 'unzip' manually using your package manager."
+                exit 1
+            fi
+            
+            if command -v unzip &> /dev/null; then
+                printf "${GREEN}✓ unzip installed successfully${NC}\n"
+            else
+                printf "${RED}✗ Failed to install unzip. Please install it manually.${NC}\n"
+                exit 1
+            fi
+        else
+            echo "Please install 'unzip' manually."
+            exit 1
+        fi
+    fi
+}
+
 # Check if VLC is installed
 check_vlc() {
     echo "Checking for VLC installation..."
@@ -197,6 +234,9 @@ main() {
     echo
     
     check_vlc
+    echo
+    
+    check_unzip
     echo
     
     create_directory
