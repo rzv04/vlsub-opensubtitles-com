@@ -2538,7 +2538,7 @@ end
 -- Parse SRT file into Lua table
 local function ai_parse_srt(filepath)
   local f = io.open(filepath, "r")
-  if not f then return {} end
+  if not f then return nil end
   
   local subs = {}
   local state = 0
@@ -2824,11 +2824,11 @@ Set-Content -Path $done_flag -Value "DONE"
           current_time = current_time / 1000000
           
           local live_file = srt_out .. ".live"
-          local subs = {}
-          if ai_file_exists(live_file) then
-              subs = ai_parse_srt(live_file)
-          elseif ai_file_exists(srt_out) then
-              subs = ai_parse_srt(srt_out)
+          
+          -- Direct attempt prevents TOCTOU race conditions
+          local subs = ai_parse_srt(live_file)
+          if not subs then
+              subs = ai_parse_srt(srt_out) or {}
           end
           
           local found_text = nil
