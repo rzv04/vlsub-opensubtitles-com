@@ -2525,6 +2525,9 @@ end
 -- ==============================================================================
 local ai_dlg = nil
 local ai_is_running = false
+local ai_osd_ch_status = nil
+local ai_osd_ch_hint = nil
+local ai_osd_ch_subs = nil
 
 -- Utility to check if file exists
 local function ai_file_exists(name)
@@ -2594,6 +2597,11 @@ function ai_start_transcription(model_index, status_label)
   if ai_is_running then return end
   ai_is_running = true
 
+  -- Lazily register OSD channels to avoid VLC startup crashes
+  if not ai_osd_ch_status then ai_osd_ch_status = vlc.osd.channel_register() end
+  if not ai_osd_ch_hint then ai_osd_ch_hint = vlc.osd.channel_register() end
+  if not ai_osd_ch_subs then ai_osd_ch_subs = vlc.osd.channel_register() end
+
   local model_names = {"tiny.en", "base.en"}
   local model_name = model_names[model_index] or "tiny.en"
   
@@ -2623,14 +2631,14 @@ function ai_start_transcription(model_index, status_label)
   end
   local video_uri = item:uri()
   if not string.match(video_uri, "^file://") then
-      vlc.osd.message("AI Error: Transcription is currently only supported for local files.", 1, "center", 5000000)
+      vlc.osd.message("AI Error: Transcription is currently only supported for local files.", ai_osd_ch_status, "center", 5000000)
       status_label:set_text("Status: Error - Network stream not supported.")
       ai_is_running = false
       return
   end
   
   -- Hint to user on how to safely abort
-  vlc.osd.message("AI Transcription initiated. To abort, press Stop (■).", 2, "top", 6000000)
+  vlc.osd.message("AI Transcription initiated. To abort, press Stop (■).", ai_osd_ch_hint, "bottom", 6000000)
 
   -- Write the background PowerShell script
   local f = io.open(ps1_file, "w")
@@ -2681,13 +2689,16 @@ Function Download-FileWithProgress {
         $stream = $wc.OpenRead($url)
         $totalSize = [int]$wc.ResponseHeaders["Content-Length"]
         $fileStream = [System.IO.File]::Create($tmpDest)
-        $buffer = New-Object byte[] 8192
+        $buffer = New-Object byte[] 65536
         $read = 0
         $downloaded = 0
         $lastPercent = -1
+        $chunks = 0
         while (($read = $stream.Read($buffer, 0, $buffer.Length)) -gt 0) {
             $fileStream.Write($buffer, 0, $read)
             $downloaded += $read
+            $chunks++
+            
             if ($totalSize -gt 0) {
                 $percent = [math]::Round(($downloaded / $totalSize) * 100)
                 if ($percent -ne $lastPercent) {
@@ -2695,11 +2706,15 @@ Function Download-FileWithProgress {
                     $lastPercent = $percent
                 }
             }
-            if ((Get-Process -Name vlc -ErrorAction SilentlyContinue) -eq $null -or (Test-Path $abort_flag)) {
-                $fileStream.Close()
-                $stream.Close()
-                Remove-Item $tmpDest -Force -ErrorAction SilentlyContinue
-                exit
+            
+            # Check abort flags every ~3MB to prevent Get-Process from bottlenecking the download speed
+            if ($chunks %% 50 -eq 0) {
+                if ((Get-Process -Name vlc -ErrorAction SilentlyContinue) -eq $null -or (Test-Path $abort_flag)) {
+                    $fileStream.Close()
+                    $stream.Close()
+                    Remove-Item $tmpDest -Force -ErrorAction SilentlyContinue
+                    exit
+                }
             }
         }
         $fileStream.Close()
@@ -2791,7 +2806,7 @@ Set-Content -Path $done_flag -Value "DONE"
           local s_text = sf:read("*line")
           sf:close()
           if s_text and s_text ~= last_status then
-              vlc.osd.message("AI: " .. s_text, 1, "top-right", 3000000)
+              vlc.osd.message("AI: " .. s_text, ai_osd_ch_status, "top-right", 3000000)
               last_status = s_text
           end
           if s_text and input_table and input_table['ai_status'] then
@@ -2825,7 +2840,7 @@ Set-Content -Path $done_flag -Value "DONE"
           end
           
           if found_text then
-              vlc.osd.message(found_text, 1, "bottom", 1000000)
+              vlc.osd.message(found_text, ai_osd_ch_subs, "bottom", 1000000)
           end
       end
   end
@@ -2835,7 +2850,7 @@ Set-Content -Path $done_flag -Value "DONE"
   -- Seamless handoff
   if ai_file_exists(srt_out) then
       add_sub(srt_out)
-      vlc.osd.message("AI Transcription Complete! Native subtitles loaded.", 1, "top-right", 4000000)
+      vlc.osd.message("AI Transcription Complete! Native subtitles loaded.", ai_osd_ch_status, "top-right", 4000000)
       if input_table and input_table['ai_status'] then
           input_table['ai_status']:set_text("Completed!")
       end
