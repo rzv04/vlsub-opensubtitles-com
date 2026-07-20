@@ -2882,7 +2882,7 @@ while ($true) {
             if ($srtLine -match '^(\d{2}):(\d{2}):(\d{2}),(\d{3}) --> (\d{2}):(\d{2}):(\d{2}),(\d{3})$') {
                 $st = [int]$Matches[1]*3600 + [int]$Matches[2]*60 + [int]$Matches[3] + [int]$Matches[4]/1000 + $offset
                 $et = [int]$Matches[5]*3600 + [int]$Matches[6]*60 + [int]$Matches[7] + [int]$Matches[8]/1000 + $offset
-                $fmtTime = { param($t) $h=[math]::Floor($t/3600); $m=[math]::Floor(($t%%3600)/60); $s=[math]::Floor($t%%60); $ms=[math]::Round(($t%%1)*1000); "{0:D2}:{1:D2}:{2:D2},{3:D3}" -f $h,$m,$s,$ms }
+                $fmtTime = { param($t) $h=[int][math]::Floor($t/3600); $m=[int][math]::Floor(($t%%3600)/60); $s=[int][math]::Floor($t%%60); $ms=[int][math]::Round(($t%%1)*1000); "{0:D2}:{1:D2}:{2:D2},{3:D3}" -f $h,$m,$s,$ms }
                 $shifted += "$(& $fmtTime $st) --> $(& $fmtTime $et)"
             } else {
                 $shifted += $srtLine
