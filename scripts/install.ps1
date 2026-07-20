@@ -61,6 +61,38 @@ if (-not $vlcFound) {
     }
 }
 
+# Check AI Transcription dependencies (ffmpeg, yt-dlp)
+Write-Host "Checking AI Transcription dependencies..." -ForegroundColor Blue
+
+# ffmpeg
+$ffmpegPath = (Get-Command ffmpeg -ErrorAction SilentlyContinue).Source
+if ($ffmpegPath) {
+    Write-Host "[OK] ffmpeg found at: $ffmpegPath" -ForegroundColor Green
+} else {
+    Write-Host "[INFO] ffmpeg not found on PATH" -ForegroundColor Yellow
+    Write-Host "  ffmpeg will be auto-downloaded on first AI transcription use." -ForegroundColor Yellow
+    Write-Host "  Or install manually: https://ffmpeg.org/download.html" -ForegroundColor Cyan
+}
+
+# ffprobe (bundled with ffmpeg)
+$ffprobePath = (Get-Command ffprobe -ErrorAction SilentlyContinue).Source
+if ($ffprobePath) {
+    Write-Host "[OK] ffprobe found at: $ffprobePath" -ForegroundColor Green
+} elseif (-not $ffmpegPath) {
+    Write-Host "[INFO] ffprobe not found (will be downloaded with ffmpeg)" -ForegroundColor Yellow
+}
+
+# yt-dlp (optional, for YouTube URL support)
+$ytdlpPath = (Get-Command yt-dlp -ErrorAction SilentlyContinue).Source
+if ($ytdlpPath) {
+    Write-Host "[OK] yt-dlp found at: $ytdlpPath" -ForegroundColor Green
+} else {
+    Write-Host "[INFO] yt-dlp not found (optional - needed for YouTube AI transcription)" -ForegroundColor Yellow
+    Write-Host "  Install: winget install yt-dlp  OR  pip install yt-dlp" -ForegroundColor Cyan
+}
+
+Write-Host ""
+
 # Set installation directory
 $vlcExtDir = "$env:APPDATA\vlc\lua\extensions"
 Write-Host "Extension directory: $vlcExtDir" -ForegroundColor Blue
@@ -144,6 +176,12 @@ Write-Host "QUICK START:" -ForegroundColor Yellow
 Write-Host "* Hash search: For exact subtitle matches" -ForegroundColor White
 Write-Host "* Name search: For flexible title-based search" -ForegroundColor White
 Write-Host "* Double-click subtitle to download and load" -ForegroundColor White
+Write-Host "* AI Transcription: Live speech-to-text (local, network, live streams)" -ForegroundColor White
+Write-Host ""
+Write-Host "AI TRANSCRIPTION DEPENDENCIES:" -ForegroundColor Yellow
+Write-Host "* ffmpeg: Auto-downloaded on first use if not on PATH" -ForegroundColor White
+Write-Host "* yt-dlp: Optional, for YouTube URL transcription" -ForegroundColor White
+Write-Host "  Install: winget install yt-dlp  OR  pip install yt-dlp" -ForegroundColor Cyan
 Write-Host ""
 Write-Host "SUPPORT & DOCUMENTATION:" -ForegroundColor Yellow
 Write-Host "* Issues: https://github.com/opensubtitles/vlsub-opensubtitles-com/issues" -ForegroundColor Cyan
