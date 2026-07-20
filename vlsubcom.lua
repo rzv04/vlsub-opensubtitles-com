@@ -2912,12 +2912,16 @@ while ($true) {
   -- Run powershell asynchronously
   os.execute(string.format('start /b powershell -ExecutionPolicy Bypass -WindowStyle Hidden -File "%s"', ps1_file))
 
+  local init_input = vlc.object.input()
+  local should_play_after_chunk = (vlc.playlist.status() == "playing")
+
   -- Pause VLC until first chunk is transcribed
-  vlc.playlist.pause()
+  if should_play_after_chunk then
+      vlc.playlist.pause()
+  end
   vlc.osd.message("AI: Preparing subtitles...", ai_osd_ch_status, "center", 10000000)
 
   -- Write initial seek hint so PowerShell knows where to start
-  local init_input = vlc.object.input()
   local init_time = vlc.var.get(init_input, "time")
   local sh = io.open(seek_hint, "w")
   if sh then
@@ -2939,6 +2943,7 @@ while ($true) {
       if ai_file_exists(done_flag) then break end
 
       if vlc.misc and vlc.misc.mwait and vlc.misc.mdate then
+        -- Wait 0.5 seconds
           vlc.misc.mwait(vlc.misc.mdate() + 500000)
       else
           local delay_start = os.clock()
@@ -2987,7 +2992,10 @@ while ($true) {
           -- Detect seek: time jumped more than 5 seconds from expected
           if not is_paused_for_chunk and math.abs(current_time - last_known_time) > 5 then
               -- User seeked! Pause and wait for chunk at new position
-              vlc.playlist.pause()
+              should_play_after_chunk = (vlc.playlist.status() == "playing")
+              if should_play_after_chunk then
+                  vlc.playlist.pause()
+              end
               is_paused_for_chunk = true
               vlc.osd.message("AI: Loading subtitles...", ai_osd_ch_status, "center", 10000000)
               -- Remove old chunk_ready signal so we wait for a fresh one
@@ -3019,7 +3027,10 @@ while ($true) {
               end
               if not cached_chunks_done[current_chunk_idx] then
                   -- Playback entered untranscribed territory, pause until ready
-                  vlc.playlist.pause()
+                  should_play_after_chunk = (vlc.playlist.status() == "playing")
+                  if should_play_after_chunk then
+                      vlc.playlist.pause()
+                  end
                   is_paused_for_chunk = true
                   vlc.osd.message("AI: Buffering subtitles...", ai_osd_ch_status, "center", 10000000)
                   os.remove(chunk_ready)
@@ -3031,7 +3042,9 @@ while ($true) {
               if ai_file_exists(chunk_ready) then
                   -- Chunk at current position is transcribed, resume!
                   os.remove(chunk_ready)
-                  vlc.playlist.play()
+                  if should_play_after_chunk then
+                      vlc.playlist.play()
+                  end
                   is_paused_for_chunk = false
                   vlc.osd.message("", ai_osd_ch_status, "center", 1)  -- clear status
               end
