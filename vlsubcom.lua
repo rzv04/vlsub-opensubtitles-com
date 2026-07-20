@@ -2746,7 +2746,7 @@ if (-not (Test-Path $ffmpeg_exe)) {
         $sys_ffprobe = (Get-Command ffprobe -ErrorAction SilentlyContinue).Source
         if ($sys_ffprobe) { $ffprobe_exe = $sys_ffprobe }
     } else {
-        Download-FileWithProgress -url "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip" -destination "$ai_dir\ffmpeg.zip" -label "Downloading ffmpeg..."
+        Download-FileWithProgress -url "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip" -destination "$ai_dir\ffmpeg.zip" -label "Downloading ffmpeg..."
         Set-Content -Path $status_file -Value "Extracting ffmpeg..."
         Expand-Archive -Force -Path "$ai_dir\ffmpeg.zip" -DestinationPath "$ai_dir\ffmpeg_temp"
         $bin_found = Get-ChildItem "$ai_dir\ffmpeg_temp" -Recurse -Filter "ffmpeg.exe" | Select-Object -First 1
@@ -2765,13 +2765,22 @@ if (-not (Test-Path $ffmpeg_exe)) {
     exit
 }
 
-# --- YouTube URL resolution via yt-dlp (best-effort) ---
+# --- Resolve URI to local path if it is a local file ---
 $resolved_uri = $video_uri
-if ($video_uri -match "youtube\.com|youtu\.be") {
+if ($video_uri -like "file://*") {
+    try {
+        $resolved_uri = ([System.Uri]$video_uri).LocalPath
+    } catch {
+        $resolved_uri = $video_uri -replace '^file:///', '' -replace '^file://', '' -replace '/', '\'
+    }
+}
+
+# --- YouTube URL resolution via yt-dlp (best-effort) ---
+if ($resolved_uri -match "youtube\.com|youtu\.be") {
     $ytdlp = (Get-Command yt-dlp -ErrorAction SilentlyContinue).Source
     if ($ytdlp) {
         Set-Content -Path $status_file -Value "Resolving YouTube URL..."
-        $yt_resolved = & $ytdlp --get-url -f "bestaudio" $video_uri 2>$null
+        $yt_resolved = & $ytdlp --get-url -f "bestaudio" $resolved_uri 2>$null
         if ($yt_resolved) { $resolved_uri = $yt_resolved }
     }
 }
