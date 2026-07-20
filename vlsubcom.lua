@@ -2617,6 +2617,10 @@ function ai_start_transcription(model_index, status_label)
   local status_file = ai_dir .. slash .. "ai_status.txt"
   local ps1_file = ai_dir .. slash .. "ai_runner.ps1"
   local abort_flag = ai_dir .. slash .. "abort_flag.txt"
+  local seek_hint = ai_dir .. slash .. "seek_hint.txt"
+  local chunks_done = ai_dir .. slash .. "chunks_done.txt"
+  local chunk_ready = ai_dir .. slash .. "chunk_ready.txt"
+  local chunks_dir = ai_dir .. slash .. "chunks"
 
   -- Ensure directory exists before Lua tries to write the ps1 file
   if not is_dir(ai_dir) then
@@ -2630,12 +2634,7 @@ function ai_start_transcription(model_index, status_label)
     return
   end
   local video_uri = item:uri()
-  if not string.match(video_uri, "^file://") then
-      vlc.osd.message("AI Error: Transcription is currently only supported for local files.", ai_osd_ch_status, "center", 5000000)
-      status_label:set_text("Status: Error - Network stream not supported.")
-      ai_is_running = false
-      return
-  end
+  -- Network streams and local files are both supported via chunked ffmpeg extraction
   
   -- Hint to user on how to safely abort
   vlc.osd.message("AI Transcription initiated. To abort, press Stop (■).", ai_osd_ch_hint, "bottom", 6000000)
@@ -2655,28 +2654,30 @@ $ErrorActionPreference = "SilentlyContinue"
 $ai_dir = "%s"
 $whisper_exe = "%s"
 $model_bin = "%s"
-$audio_wav = "%s"
 $srt_out = "%s"
 $done_flag = "%s"
 $status_file = "%s"
 $video_uri = "%s"
 $abort_flag = "%s"
+$seek_hint = "%s"
+$chunks_done_file = "%s"
+$chunk_ready = "%s"
+$chunks_dir = "%s"
+$ffmpeg_exe = "$ai_dir\ffmpeg.exe"
+$ffprobe_exe = "$ai_dir\ffprobe.exe"
+$chunk_seconds = 30
 
 if (Test-Path $abort_flag) { Remove-Item $abort_flag }
+if (Test-Path $done_flag) { Remove-Item $done_flag }
+if (Test-Path $chunk_ready) { Remove-Item $chunk_ready }
+if (Test-Path $chunks_done_file) { Remove-Item $chunks_done_file }
+if (Test-Path "$srt_out.live") { Remove-Item "$srt_out.live" }
+New-Item -ItemType Directory -Force -Path $chunks_dir | Out-Null
 
-Function Monitor-Process {
-    param($proc)
-    while (-not $proc.HasExited) {
-        if ((Get-Process -Name vlc -ErrorAction SilentlyContinue) -eq $null) {
-            $proc.Kill()
-            exit
-        }
-        if (Test-Path $abort_flag) {
-            $proc.Kill()
-            exit
-        }
-        Start-Sleep -Milliseconds 500
-    }
+Function Check-Abort {
+    if ((Get-Process -Name vlc -ErrorAction SilentlyContinue) -eq $null) { return $true }
+    if (Test-Path $abort_flag) { return $true }
+    return $false
 }
 
 Set-Content -Path $status_file -Value "Checking dependencies..."
@@ -2693,11 +2694,11 @@ Function Download-FileWithProgress {
         $read = 0
         $downloaded = 0
         $lastPercent = -1
-        $chunks = 0
+        $dlChunks = 0
         while (($read = $stream.Read($buffer, 0, $buffer.Length)) -gt 0) {
             $fileStream.Write($buffer, 0, $read)
             $downloaded += $read
-            $chunks++
+            $dlChunks++
             
             if ($totalSize -gt 0) {
                 $percent = [math]::Round(($downloaded / $totalSize) * 100)
@@ -2707,9 +2708,8 @@ Function Download-FileWithProgress {
                 }
             }
             
-            # Check abort flags every ~3MB to prevent Get-Process from bottlenecking the download speed
-            if ($chunks %% 50 -eq 0) {
-                if ((Get-Process -Name vlc -ErrorAction SilentlyContinue) -eq $null -or (Test-Path $abort_flag)) {
+            if ($dlChunks %% 50 -eq 0) {
+                if (Check-Abort) {
                     $fileStream.Close()
                     $stream.Close()
                     Remove-Item $tmpDest -Force -ErrorAction SilentlyContinue
@@ -2727,6 +2727,7 @@ Function Download-FileWithProgress {
     }
 }
 
+# --- Dependency: Whisper ---
 if (-not (Test-Path $whisper_exe)) {
     Download-FileWithProgress -url "https://github.com/ggerganov/whisper.cpp/releases/download/v1.5.4/whisper-bin-x64.zip" -destination "$ai_dir\whisper-bin-x64.zip" -label "Downloading Whisper..."
     Set-Content -Path $status_file -Value "Extracting Whisper..."
@@ -2737,39 +2738,150 @@ if (-not (Test-Path $model_bin)) {
     Download-FileWithProgress -url "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-%s.bin" -destination $model_bin -label "Downloading Model..."
 }
 
-Set-Content -Path $status_file -Value "Extracting audio (~30s)..."
-if (Test-Path $audio_wav) { Remove-Item $audio_wav }
-if (Test-Path $srt_out) { Remove-Item $srt_out }
-if (Test-Path "$srt_out.live") { Remove-Item "$srt_out.live" }
-if (Test-Path $done_flag) { Remove-Item $done_flag }
+# --- Dependency: ffmpeg ---
+if (-not (Test-Path $ffmpeg_exe)) {
+    $sys_ffmpeg = (Get-Command ffmpeg -ErrorAction SilentlyContinue).Source
+    if ($sys_ffmpeg) {
+        $ffmpeg_exe = $sys_ffmpeg
+        $sys_ffprobe = (Get-Command ffprobe -ErrorAction SilentlyContinue).Source
+        if ($sys_ffprobe) { $ffprobe_exe = $sys_ffprobe }
+    } else {
+        Download-FileWithProgress -url "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip" -destination "$ai_dir\ffmpeg.zip" -label "Downloading ffmpeg..."
+        Set-Content -Path $status_file -Value "Extracting ffmpeg..."
+        Expand-Archive -Force -Path "$ai_dir\ffmpeg.zip" -DestinationPath "$ai_dir\ffmpeg_temp"
+        $bin_found = Get-ChildItem "$ai_dir\ffmpeg_temp" -Recurse -Filter "ffmpeg.exe" | Select-Object -First 1
+        if ($bin_found) {
+            Copy-Item $bin_found.FullName $ffmpeg_exe
+            $probe_found = Join-Path $bin_found.DirectoryName "ffprobe.exe"
+            if (Test-Path $probe_found) { Copy-Item $probe_found $ffprobe_exe }
+        }
+        Remove-Item "$ai_dir\ffmpeg_temp" -Recurse -Force -ErrorAction SilentlyContinue
+        Remove-Item "$ai_dir\ffmpeg.zip" -Force -ErrorAction SilentlyContinue
+    }
+}
 
-$vlc = (Get-Process -Name vlc | Select-Object -First 1).Path
-if (-not $vlc) { $vlc = "vlc.exe" }
-
-$vlcArgs = @(
-    "-I", "dummy",
-    "--no-one-instance",
-    "--no-loop",
-    "--no-video",
-    $video_uri,
-    "--sout=#transcode{acodec=s16l,channels=1,samplerate=16000}:std{access=file,mux=wav,dst='$audio_wav'}",
-    "vlc://quit"
-)
-$vlcProc = Start-Process -FilePath $vlc -ArgumentList $vlcArgs -PassThru -WindowStyle Hidden
-Monitor-Process -proc $vlcProc
-
-if (-not (Test-Path $audio_wav)) {
-    Set-Content -Path $status_file -Value "Error: Audio extraction failed."
+if (-not (Test-Path $ffmpeg_exe)) {
+    Set-Content -Path $status_file -Value "Error: ffmpeg not found and download failed."
     exit
 }
 
-Set-Content -Path $status_file -Value "Transcribing...You may play the video."
-$whisperProc = Start-Process -FilePath $whisper_exe -ArgumentList "-m `"$model_bin`" -f `"$audio_wav`" -osrt" -RedirectStandardOutput "$srt_out.live" -PassThru -WindowStyle Hidden
-Monitor-Process -proc $whisperProc
+# --- YouTube URL resolution via yt-dlp (best-effort) ---
+$resolved_uri = $video_uri
+if ($video_uri -match "youtube\.com|youtu\.be") {
+    $ytdlp = (Get-Command yt-dlp -ErrorAction SilentlyContinue).Source
+    if ($ytdlp) {
+        Set-Content -Path $status_file -Value "Resolving YouTube URL..."
+        $yt_resolved = & $ytdlp --get-url -f "bestaudio" $video_uri 2>$null
+        if ($yt_resolved) { $resolved_uri = $yt_resolved }
+    }
+}
 
-Set-Content -Path $status_file -Value "Done!"
-Set-Content -Path $done_flag -Value "DONE"
-]], ai_dir, whisper_exe, model_bin, audio_wav, srt_out, done_flag, status_file, video_uri, abort_flag, model_name)
+# --- Detect finite vs. live stream via ffprobe ---
+$is_live = $true
+$total_chunks = [int]::MaxValue
+if (Test-Path $ffprobe_exe) {
+    $dur_str = & $ffprobe_exe -v error -show_entries format=duration -of csv=p=0 $resolved_uri 2>$null
+    $duration = 0
+    if ([double]::TryParse($dur_str, [ref]$duration) -and $duration -gt 0) {
+        $is_live = $false
+        $total_chunks = [math]::Ceiling($duration / $chunk_seconds)
+    }
+}
+
+# --- Main chunked transcription loop ---
+$completed = @{}
+$sequential_index = 0
+
+Set-Content -Path $status_file -Value "Transcribing..."
+
+while ($true) {
+    if (Check-Abort) { exit }
+    
+    # Determine target chunk
+    $target_chunk = -1
+    if ($is_live) {
+        $target_chunk = $sequential_index
+    } else {
+        # Read seek hint from Lua
+        $hint = 0
+        $hint_str = Get-Content $seek_hint -ErrorAction SilentlyContinue
+        if ($hint_str) { [double]::TryParse($hint_str, [ref]$hint) | Out-Null }
+        $current_chunk = [math]::Floor($hint / $chunk_seconds)
+        
+        # Find first uncompleted chunk from current position forward (up to 2 ahead)
+        for ($i = $current_chunk; $i -le ($current_chunk + 2) -and $i -lt $total_chunks; $i++) {
+            if ($i -ge 0 -and -not $completed.ContainsKey($i)) {
+                $target_chunk = $i
+                break
+            }
+        }
+    }
+    
+    # All nearby chunks done — check if fully done (finite) or idle-wait
+    if ($target_chunk -eq -1) {
+        if (-not $is_live -and $completed.Count -ge $total_chunks) {
+            Set-Content -Path $status_file -Value "Done!"
+            Set-Content -Path $done_flag -Value "DONE"
+            break
+        }
+        Start-Sleep -Seconds 1
+        continue
+    }
+    
+    # Skip if already completed
+    if ($completed.ContainsKey($target_chunk)) {
+        if ($is_live) { Start-Sleep -Seconds 1 }
+        continue
+    }
+    
+    # Extract chunk audio via ffmpeg
+    $offset = $target_chunk * $chunk_seconds
+    $chunk_name = "chunk_" + $target_chunk.ToString("D5")
+    $chunk_wav = "$chunks_dir\$chunk_name.wav"
+    
+    if ($is_live) {
+        # Live: no seeking, just record the next N seconds
+        $ffArgs = @("-y", "-i", $resolved_uri, "-t", $chunk_seconds, "-ac", "1", "-ar", "16000", $chunk_wav)
+    } else {
+        # Finite: seek to offset and extract chunk
+        $ffArgs = @("-y", "-ss", $offset, "-t", $chunk_seconds, "-i", $resolved_uri, "-ac", "1", "-ar", "16000", $chunk_wav)
+    }
+    
+    $ffProc = Start-Process -FilePath $ffmpeg_exe -ArgumentList $ffArgs -PassThru -WindowStyle Hidden -Wait
+    
+    if (Check-Abort) { exit }
+    if (-not (Test-Path $chunk_wav)) {
+        Start-Sleep -Seconds 2
+        continue
+    }
+    
+    # Transcribe chunk via whisper (with timestamp offset)
+    $offset_ms = $offset * 1000
+    $wArgs = "-m `"$model_bin`" -f `"$chunk_wav`" -ot $offset_ms -osrt"
+    $wProc = Start-Process -FilePath $whisper_exe -ArgumentList $wArgs -PassThru -WindowStyle Hidden -Wait
+    
+    if (Check-Abort) { exit }
+    
+    # whisper outputs to chunk_NNNNN.wav.srt
+    $chunk_srt = "$chunk_wav.srt"
+    if (Test-Path $chunk_srt) {
+        Get-Content $chunk_srt | Add-Content "$srt_out.live"
+    }
+    
+    # Signal chunk ready (Lua will detect this and resume VLC if paused)
+    Set-Content -Path $chunk_ready -Value $target_chunk
+    
+    # Track completion and cleanup chunk files
+    $completed[$target_chunk] = $true
+    Add-Content -Path $chunks_done_file -Value $target_chunk
+    Remove-Item $chunk_wav -Force -ErrorAction SilentlyContinue
+    Remove-Item $chunk_srt -Force -ErrorAction SilentlyContinue
+    
+    if ($is_live) { $sequential_index++ }
+    
+    Set-Content -Path $status_file -Value "Transcribing... ($($completed.Count) chunks done)"
+}
+]], ai_dir, whisper_exe, model_bin, srt_out, done_flag, status_file, video_uri, abort_flag, seek_hint, chunks_done, chunk_ready, chunks_dir, model_name)
 
   f:write(ps_script)
   f:close()
@@ -2777,10 +2889,28 @@ Set-Content -Path $done_flag -Value "DONE"
   -- Run powershell asynchronously
   os.execute(string.format('start /b powershell -ExecutionPolicy Bypass -WindowStyle Hidden -File "%s"', ps1_file))
 
+  -- Pause VLC until first chunk is transcribed
+  vlc.playlist.pause()
+  vlc.osd.message("AI: Preparing subtitles...", ai_osd_ch_status, "center", 10000000)
+
+  -- Write initial seek hint so PowerShell knows where to start
+  local init_input = vlc.object.input()
+  local init_time = vlc.var.get(init_input, "time")
+  local sh = io.open(seek_hint, "w")
+  if sh then
+      sh:write(tostring((init_time or 0) / 1000000))
+      sh:close()
+  end
+
   -- OSD Polling Loop
-  local input_obj = vlc.object.input()
+  local input_obj = init_input
   local last_status = ""
-  while ai_is_running and not ai_file_exists(done_flag) do
+  local last_known_time = (init_time or 0) / 1000000
+  local is_paused_for_chunk = true  -- Start paused, waiting for first chunk
+  while ai_is_running do
+      -- Check done flag (only written for finite sources)
+      if ai_file_exists(done_flag) then break end
+
       if vlc.misc and vlc.misc.mwait and vlc.misc.mdate then
           vlc.misc.mwait(vlc.misc.mdate() + 500000)
       else
@@ -2794,8 +2924,8 @@ Set-Content -Path $done_flag -Value "DONE"
       local current_uri = ""
       if current_item then current_uri = current_item:uri() end
       if current_uri ~= video_uri then
-          local f = io.open(abort_flag, "w")
-          if f then f:write("ABORT"); f:close() end
+          local af = io.open(abort_flag, "w")
+          if af then af:write("ABORT"); af:close() end
           ai_is_running = false
           break
       end
@@ -2818,18 +2948,42 @@ Set-Content -Path $done_flag -Value "DONE"
           end
       end
       
-      -- Push OSD
+      -- Get current playback time
       local current_time = vlc.var.get(input_obj, "time")
       if current_time then
           current_time = current_time / 1000000
           
-          local live_file = srt_out .. ".live"
+          -- Write seek hint for PowerShell chunk prioritization
+          local sh_w = io.open(seek_hint, "w")
+          if sh_w then sh_w:write(tostring(current_time)); sh_w:close() end
           
-          -- Direct attempt prevents TOCTOU race conditions
-          local subs = ai_parse_srt(live_file)
-          if not subs then
-              subs = ai_parse_srt(srt_out) or {}
+          -- Detect seek: time jumped more than 5 seconds from expected
+          if not is_paused_for_chunk and math.abs(current_time - last_known_time) > 5 then
+              -- User seeked! Pause and wait for chunk at new position
+              vlc.playlist.pause()
+              is_paused_for_chunk = true
+              vlc.osd.message("AI: Loading subtitles...", ai_osd_ch_status, "center", 10000000)
+              -- Remove old chunk_ready signal so we wait for a fresh one
+              os.remove(chunk_ready)
           end
+          
+          -- If paused waiting for chunk, check if it's ready
+          if is_paused_for_chunk then
+              if ai_file_exists(chunk_ready) then
+                  -- Chunk at current position is transcribed, resume!
+                  os.remove(chunk_ready)
+                  vlc.playlist.play()
+                  is_paused_for_chunk = false
+                  vlc.osd.message("", ai_osd_ch_status, "center", 1)  -- clear status
+              end
+          end
+          
+          -- Update expected time for next iteration (current + poll interval)
+          last_known_time = current_time + 0.5
+          
+          -- OSD subtitle display
+          local live_file = srt_out .. ".live"
+          local subs = ai_parse_srt(live_file) or {}
           
           local found_text = nil
           for _, sub in ipairs(subs) do
@@ -2847,20 +3001,20 @@ Set-Content -Path $done_flag -Value "DONE"
 
   ai_is_running = false
 
-  -- Seamless handoff
-  if ai_file_exists(srt_out) then
-      add_sub(srt_out)
-      vlc.osd.message("AI Transcription Complete! Native subtitles loaded.", ai_osd_ch_status, "top-right", 4000000)
-      if input_table and input_table['ai_status'] then
-          input_table['ai_status']:set_text("Completed!")
-      end
+  -- Signal completion (no SRT file produced — OSD-only transcription)
+  vlc.osd.message("AI Transcription Complete!", ai_osd_ch_status, "top-right", 4000000)
+  if input_table and input_table['ai_status'] then
+      input_table['ai_status']:set_text("Completed!")
   end
   
   -- Cleanup temp files
-  os.remove(audio_wav)
   os.remove(done_flag)
   os.remove(ps1_file)
   os.remove(srt_out .. ".live")
+  os.remove(seek_hint)
+  os.remove(chunks_done)
+  os.remove(chunk_ready)
+  os.execute('powershell -WindowStyle Hidden -Command "Remove-Item -Recurse -Force \'' .. chunks_dir .. '\' -ErrorAction SilentlyContinue"')
 end
 
 function ai_start_transcription_proxy()
