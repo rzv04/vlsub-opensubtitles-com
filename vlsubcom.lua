@@ -2930,6 +2930,10 @@ while ($true) {
   local last_status = ""
   local last_known_time = (init_time or 0) / 1000000
   local is_paused_for_chunk = true  -- Start paused, waiting for first chunk
+  local cached_chunks_done = {}     -- Cache completed chunk indices
+  local cached_subs = {}            -- Cache parsed SRT entries
+  local last_live_size = 0          -- Track .live file size for cache invalidation
+  local last_chunks_done_size = 0   -- Track chunks_done file size for cache invalidation
   while ai_is_running do
       -- Check done flag (only written for finite sources)
       if ai_file_exists(done_flag) then break end
@@ -2993,18 +2997,27 @@ while ($true) {
           -- Buffer underrun: check if current chunk has been transcribed
           if not is_paused_for_chunk then
               local current_chunk_idx = math.floor(current_time / 30)
-              local chunk_available = false
-              local cd = io.open(chunks_done, "r")
-              if cd then
-                  for cline in cd:lines() do
-                      if tonumber(cline) == current_chunk_idx then
-                          chunk_available = true
-                          break
-                      end
-                  end
-                  cd:close()
+              -- Refresh chunks_done cache only when file changes
+              local cd_size = 0
+              local cd_check = io.open(chunks_done, "r")
+              if cd_check then
+                  cd_check:seek("end")
+                  cd_size = cd_check:seek()
+                  cd_check:close()
               end
-              if not chunk_available then
+              if cd_size ~= last_chunks_done_size then
+                  last_chunks_done_size = cd_size
+                  cached_chunks_done = {}
+                  local cd = io.open(chunks_done, "r")
+                  if cd then
+                      for cline in cd:lines() do
+                          local idx = tonumber(cline)
+                          if idx then cached_chunks_done[idx] = true end
+                      end
+                      cd:close()
+                  end
+              end
+              if not cached_chunks_done[current_chunk_idx] then
                   -- Playback entered untranscribed territory, pause until ready
                   vlc.playlist.pause()
                   is_paused_for_chunk = true
@@ -3027,12 +3040,22 @@ while ($true) {
           -- Update expected time for next iteration (current + poll interval)
           last_known_time = current_time + 0.5
           
-          -- OSD subtitle display
+          -- OSD subtitle display (with file-size cache)
           local live_file = srt_out .. ".live"
-          local subs = ai_parse_srt(live_file) or {}
+          local lf_size = 0
+          local lf_check = io.open(live_file, "r")
+          if lf_check then
+              lf_check:seek("end")
+              lf_size = lf_check:seek()
+              lf_check:close()
+          end
+          if lf_size ~= last_live_size then
+              last_live_size = lf_size
+              cached_subs = ai_parse_srt(live_file) or {}
+          end
           
           local found_text = nil
-          for _, sub in ipairs(subs) do
+          for _, sub in ipairs(cached_subs) do
               if current_time >= sub.start_s and current_time <= sub.end_s then
                   found_text = sub.text
                   break
