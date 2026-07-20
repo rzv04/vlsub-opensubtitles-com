@@ -2828,6 +2828,8 @@ while ($true) {
     
     # All nearby chunks done — check if fully done (finite) or idle-wait
     if ($target_chunk -eq -1) {
+        # Signal chunk ready so Lua can resume if paused (seek-back to completed region)
+        Set-Content -Path $chunk_ready -Value "done"
         if (-not $is_live -and $completed.Count -ge $total_chunks) {
             Set-Content -Path $status_file -Value "Done!"
             Set-Content -Path $done_flag -Value "DONE"
@@ -2864,17 +2866,29 @@ while ($true) {
         continue
     }
     
-    # Transcribe chunk via whisper (with timestamp offset)
-    $offset_ms = $offset * 1000
-    $wArgs = "-m `"$model_bin`" -f `"$chunk_wav`" -ot $offset_ms -osrt"
+    # Transcribe chunk via whisper (no -ot; we shift timestamps in post-processing)
+    $wArgs = "-m `"$model_bin`" -f `"$chunk_wav`" -osrt"
     $wProc = Start-Process -FilePath $whisper_exe -ArgumentList $wArgs -PassThru -WindowStyle Hidden -Wait
     
     if (Check-Abort) { exit }
     
-    # whisper outputs to chunk_NNNNN.wav.srt
+    # whisper outputs to chunk_NNNNN.wav.srt with timestamps starting at 0
+    # Shift all timestamps by $offset seconds to align with video timeline
     $chunk_srt = "$chunk_wav.srt"
     if (Test-Path $chunk_srt) {
-        Get-Content $chunk_srt | Add-Content "$srt_out.live"
+        $srtLines = Get-Content $chunk_srt
+        $shifted = @()
+        foreach ($srtLine in $srtLines) {
+            if ($srtLine -match '^(\d{2}):(\d{2}):(\d{2}),(\d{3}) --> (\d{2}):(\d{2}):(\d{2}),(\d{3})$') {
+                $st = [int]$Matches[1]*3600 + [int]$Matches[2]*60 + [int]$Matches[3] + [int]$Matches[4]/1000 + $offset
+                $et = [int]$Matches[5]*3600 + [int]$Matches[6]*60 + [int]$Matches[7] + [int]$Matches[8]/1000 + $offset
+                $fmtTime = { param($t) $h=[math]::Floor($t/3600); $m=[math]::Floor(($t%%3600)/60); $s=[math]::Floor($t%%60); $ms=[math]::Round(($t%%1)*1000); "{0:D2}:{1:D2}:{2:D2},{3:D3}" -f $h,$m,$s,$ms }
+                $shifted += "$(& $fmtTime $st) --> $(& $fmtTime $et)"
+            } else {
+                $shifted += $srtLine
+            }
+        }
+        $shifted | Add-Content "$srt_out.live"
     }
     
     # Signal chunk ready (Lua will detect this and resume VLC if paused)
@@ -2974,6 +2988,29 @@ while ($true) {
               vlc.osd.message("AI: Loading subtitles...", ai_osd_ch_status, "center", 10000000)
               -- Remove old chunk_ready signal so we wait for a fresh one
               os.remove(chunk_ready)
+          end
+          
+          -- Buffer underrun: check if current chunk has been transcribed
+          if not is_paused_for_chunk then
+              local current_chunk_idx = math.floor(current_time / 30)
+              local chunk_available = false
+              local cd = io.open(chunks_done, "r")
+              if cd then
+                  for cline in cd:lines() do
+                      if tonumber(cline) == current_chunk_idx then
+                          chunk_available = true
+                          break
+                      end
+                  end
+                  cd:close()
+              end
+              if not chunk_available then
+                  -- Playback entered untranscribed territory, pause until ready
+                  vlc.playlist.pause()
+                  is_paused_for_chunk = true
+                  vlc.osd.message("AI: Buffering subtitles...", ai_osd_ch_status, "center", 10000000)
+                  os.remove(chunk_ready)
+              end
           end
           
           -- If paused waiting for chunk, check if it's ready
