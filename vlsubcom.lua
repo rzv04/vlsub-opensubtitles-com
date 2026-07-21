@@ -974,6 +974,22 @@ function compare_versions(version1, version2)
   return 0
 end
 
+-- Utility functions for safe OS command execution
+local function escape_cmd_win(str)
+  if not str then return "" end
+  return str:gsub('"', '')
+end
+
+local function escape_cmd_posix(str)
+  if not str then return "" end
+  return str:gsub("'", "'\\''")
+end
+
+local function escape_powershell(str)
+  if not str then return "" end
+  return str:gsub("'", "''")
+end
+
 -- Function to get installation instructions for the user's OS
 function get_install_instructions(download_url)
   local instructions = {}
@@ -1702,11 +1718,12 @@ end
 
 
 function close()
-  vlc.deactivate()
+  ai_abort_transcription()
 end
 
 function deactivate()
   vlc.msg.dbg("[VLsub] Bye bye!")
+  ai_abort_transcription()
   if dlg then
     dlg:hide()
   end
@@ -1994,9 +2011,12 @@ function subSource.search(movie_title, languages_str, season, episode, imdb_id, 
 
   local full_lang_name = nil
   if state.languages_str and state.languages_str ~= "" and state.languages_str ~= "all" then
-    local primary_lang = string.match(state.languages_str, "^([^,]+)") or state.languages_str
-    primary_lang = string.lower(primary_lang)
-    full_lang_name = lang_code_to_name[primary_lang] or primary_lang
+    local mapped_langs = {}
+    for l in string.gmatch(state.languages_str, "([^,]+)") do
+      local lower_l = string.lower(l)
+      table.insert(mapped_langs, lang_code_to_name[lower_l] or lower_l)
+    end
+    full_lang_name = table.concat(mapped_langs, ",")
   end
 
   local client = Curl.new()
@@ -2107,10 +2127,12 @@ function subSource.search(movie_title, languages_str, season, episode, imdb_id, 
 
       local has_season = string.find(fname, string.format("S%s", s_padded), 1, true) ~= nil
                       or string.find(fname, string.format("%dX", season_num), 1, true) ~= nil
+                      or string.find(fname, string.format("%dE", season_num), 1, true) ~= nil
 
       if has_season then
         if e_padded then
           local has_any_ep = string.find(fname, string.format("S%sE", s_padded), 1, true) ~= nil
+                          or string.find(fname, string.format("%dE", season_num), 1, true) ~= nil
           if has_any_ep then
             matched = string.find(fname, string.format("E%s", e_padded), 1, true) ~= nil
                    or string.find(fname, string.format("E0*%d[^0-9]", episode_num)) ~= nil
@@ -2212,7 +2234,8 @@ local function score_srt_for_episode(fname, season_num, episode_num)
     local s_padded = string.format("%02d", season_num)
     -- Season match
     if string.find(upper, string.format("S%s", s_padded), 1, true) or
-       string.find(upper, string.format("%dX", season_num), 1, true) then
+       string.find(upper, string.format("%dX", season_num), 1, true) or
+       string.find(upper, string.format("%dE", season_num), 1, true) then
       score = score + 10
     else
       return -1  -- wrong season entirely
@@ -2223,7 +2246,8 @@ local function score_srt_for_episode(fname, season_num, episode_num)
       if string.find(upper, string.format("E%s", e_padded), 1, true) or
          string.find(upper, string.format("E0*%d[^0-9]", episode_num)) then
         score = score + 20  -- individual episode file — highest priority
-      elseif string.find(upper, string.format("S%sE", s_padded), 1, true) then
+      elseif string.find(upper, string.format("S%sE", s_padded), 1, true) or
+             string.find(upper, string.format("%dE", season_num), 1, true) then
         return -1  -- different episode
       else
         score = score + 5  -- season pack — lower priority than individual episode
@@ -2307,21 +2331,28 @@ function subSource.downloadSubtitle(item)
   local extract_dir = tmp_dir .. path_sep .. "vlsub_subsource_" .. tostring(sub_id)
 
   vlc.msg.dbg("[SubSource] Saving ZIP to: " .. zip_path)
-  local zf = io.open(zip_path, "wb")
+  local zf, err = io.open(zip_path, "wb")
   if not zf then
-    setMessage(error_tag("Cannot write ZIP temp file"))
+    setMessage(error_tag("Cannot write ZIP temp file: " .. tostring(err)))
     return false
   end
-  zf:write(raw_body)
-  zf:flush()
+  local ok, write_err = pcall(function()
+    zf:write(raw_body)
+    zf:flush()
+  end)
   zf:close()
+  if not ok then
+    setMessage(error_tag("Failed to write to ZIP: " .. tostring(write_err)))
+    os.remove(zip_path)
+    return false
+  end
 
   -- Extract ZIP
   local ext_cmd = ""
   if is_windows then
-    ext_cmd = string.format('powershell -NoProfile -Command "Expand-Archive -LiteralPath \'%s\' -DestinationPath \'%s\' -Force"', zip_path, extract_dir)
+    ext_cmd = string.format('powershell -WindowStyle Hidden -NoProfile -Command "Expand-Archive -LiteralPath \'%s\' -DestinationPath \'%s\' -Force"', escape_powershell(zip_path), escape_powershell(extract_dir))
   else
-    ext_cmd = string.format("unzip -o '%s' -d '%s' > /dev/null 2>&1", zip_path, extract_dir)
+    ext_cmd = string.format("unzip -o '%s' -d '%s' > /dev/null 2>&1", escape_cmd_posix(zip_path), escape_cmd_posix(extract_dir))
   end
   vlc.msg.dbg("[SubSource] Extracting ZIP: " .. ext_cmd)
   local ok_extract = os.execute(ext_cmd)
@@ -2333,9 +2364,9 @@ function subSource.downloadSubtitle(item)
   -- List extracted SRT files
   local list_cmd = ""
   if is_windows then
-    list_cmd = string.format('powershell -NoProfile -Command "Get-ChildItem -Path \'%s\' -Recurse -Include *.srt,*.sub,*.ass | Select-Object -ExpandProperty FullName"', extract_dir)
+    list_cmd = string.format('powershell -WindowStyle Hidden -NoProfile -Command "Get-ChildItem -Path \'%s\' -Recurse -Include *.srt,*.sub,*.ass | Select-Object -ExpandProperty FullName"', escape_powershell(extract_dir))
   else
-    list_cmd = string.format("find '%s' -type f \\( -iname \"*.srt\" -o -iname \"*.sub\" -o -iname \"*.ass\" \\)", extract_dir)
+    list_cmd = string.format("find '%s' -type f \\( -iname \"*.srt\" -o -iname \"*.sub\" -o -iname \"*.ass\" \\)", escape_cmd_posix(extract_dir))
   end
   
   local pipe = io.popen(list_cmd)
@@ -2543,8 +2574,8 @@ local function ai_parse_srt(filepath)
   local subs = {}
   local state = 0
   local current_sub = {}
-  for line in f:lines() do
-      line = string.gsub(line, "\r", "")
+  for raw_line in f:lines() do
+      local line = string.gsub(raw_line, "\r", "")
       
       -- Format 1: Whisper stdout [00:00:00.000 --> 00:00:00.000] Text
       local w_ts, w_te, w_text = string.match(line, "^%[(%d%d:%d%d:%d%d%.%d%d%d) %-%-%> (%d%d:%d%d:%d%d%.%d%d%d)%]%s*(.*)")
@@ -2593,17 +2624,50 @@ local function ai_parse_srt(filepath)
   return subs
 end
 
-function ai_start_transcription(model_index, status_label)
+function ai_abort_transcription()
+  if not ai_is_running then return end
+  local slash = package.config:sub(1,1)
+  local ai_dir = openSub.conf.dirPath .. slash .. "vlsub_ai"
+  local abort_flag = ai_dir .. slash .. "abort_flag.txt"
+  local pid_file = ai_dir .. slash .. "pid.txt"
+  
+  local pid_f = io.open(pid_file, "r")
+  if pid_f then
+      local pid = pid_f:read("*l")
+      pid_f:close()
+      if pid and pid ~= "" then
+          os.execute('taskkill /F /PID ' .. pid .. ' /T >nul 2>&1')
+      end
+  end
+  local af = io.open(abort_flag, "w")
+  if af then af:write("ABORT"); af:close() end
+  ai_is_running = false
+  if input_table and input_table['ai_start'] then
+      input_table['ai_start']:set_text("🎙️ Transcribe")
+  end
+  vlc.msg.dbg("[VLSub] AI Transcription forcefully aborted via cleanup routine.")
+end
+
+function ai_start_transcription(status_label)
   if ai_is_running then return end
   ai_is_running = true
 
-  -- Lazily register OSD channels to avoid VLC startup crashes
-  if not ai_osd_ch_status then ai_osd_ch_status = vlc.osd.channel_register() end
-  if not ai_osd_ch_hint then ai_osd_ch_hint = vlc.osd.channel_register() end
-  if not ai_osd_ch_subs then ai_osd_ch_subs = vlc.osd.channel_register() end
+  if input_table and input_table['ai_start'] then
+      input_table['ai_start']:set_text("⏹ Abort")
+  end
 
-  local model_names = {"tiny.en", "base.en"}
-  local model_name = model_names[model_index] or "tiny.en"
+  -- Always register OSD channels to avoid invalid channel crashes on video switch
+  ai_osd_ch_status = vlc.osd.channel_register()
+  ai_osd_ch_hint = vlc.osd.channel_register()
+  ai_osd_ch_subs = vlc.osd.channel_register()
+
+  local model_name = openSub.option.ai_model or "tiny"
+  local ai_language = openSub.option.ai_language or "auto"
+  local lang_arg = ""
+  if string.lower(ai_language) ~= "auto" then
+      local iso_code = string.sub(string.lower(ai_language), 1, 2)
+      lang_arg = " -l " .. iso_code
+  end
   
   -- Store everything in a dedicated vlsub_ai subfolder
   local ai_dir = openSub.conf.dirPath .. slash .. "vlsub_ai"
@@ -2617,6 +2681,7 @@ function ai_start_transcription(model_index, status_label)
   local status_file = ai_dir .. slash .. "ai_status.txt"
   local ps1_file = ai_dir .. slash .. "ai_runner.ps1"
   local abort_flag = ai_dir .. slash .. "abort_flag.txt"
+  local pid_file = ai_dir .. slash .. "pid.txt"
   local seek_hint = ai_dir .. slash .. "seek_hint.txt"
   local chunks_done = ai_dir .. slash .. "chunks_done.txt"
   local chunk_ready = ai_dir .. slash .. "chunk_ready.txt"
@@ -2624,7 +2689,17 @@ function ai_start_transcription(model_index, status_label)
 
   -- Ensure directory exists before Lua tries to write the ps1 file
   if not is_dir(ai_dir) then
-      local success = os.execute('powershell -WindowStyle Hidden -Command "New-Item -ItemType Directory -Force -Path \'' .. ai_dir .. '\'"')
+      local success = os.execute('powershell -WindowStyle Hidden -Command "New-Item -ItemType Directory -Force -Path \'' .. escape_powershell(ai_dir) .. '\'"')
+  end
+
+  -- Kill any orphaned background processes from a previous crash
+  local pid_f = io.open(pid_file, "r")
+  if pid_f then
+      local pid = pid_f:read("*l")
+      pid_f:close()
+      if pid and pid ~= "" then
+          os.execute('taskkill /F /PID ' .. pid .. ' /T >nul 2>&1')
+      end
   end
 
   local item = vlc.input.item()
@@ -2650,6 +2725,7 @@ function ai_start_transcription(model_index, status_label)
   local ps_script = string.format([[
 $ErrorActionPreference = "SilentlyContinue"
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+$PID | Out-File -FilePath "%s" -Encoding ascii
 
 $ai_dir = "%s"
 $whisper_exe = "%s"
@@ -2858,7 +2934,7 @@ while ($true) {
         $ffArgs = @("-y", "-ss", $offset, "-t", $chunk_seconds, "-i", $resolved_uri, "-ac", "1", "-ar", "16000", $chunk_wav)
     }
     
-    $ffProc = Start-Process -FilePath $ffmpeg_exe -ArgumentList $ffArgs -PassThru -WindowStyle Hidden -Wait
+    & $ffmpeg_exe @ffArgs *>$null
     
     if (Check-Abort) { exit }
     if (-not (Test-Path $chunk_wav)) {
@@ -2867,8 +2943,12 @@ while ($true) {
     }
     
     # Transcribe chunk via whisper (no -ot; we shift timestamps in post-processing)
-    $wArgs = "-m `"$model_bin`" -f `"$chunk_wav`" -osrt"
-    $wProc = Start-Process -FilePath $whisper_exe -ArgumentList $wArgs -PassThru -WindowStyle Hidden -Wait
+    $wArgs = @("-m", $model_bin, "-f", $chunk_wav, "-osrt")
+    $lang_str = "%s".Trim()
+    if ($lang_str -ne "") {
+        $wArgs += $lang_str.Split(" ", [System.StringSplitOptions]::RemoveEmptyEntries)
+    }
+    & $whisper_exe @wArgs *>$null
     
     if (Check-Abort) { exit }
     
@@ -2882,7 +2962,7 @@ while ($true) {
             if ($srtLine -match '^(\d{2}):(\d{2}):(\d{2}),(\d{3}) --> (\d{2}):(\d{2}):(\d{2}),(\d{3})$') {
                 $st = [int]$Matches[1]*3600 + [int]$Matches[2]*60 + [int]$Matches[3] + [int]$Matches[4]/1000 + $offset
                 $et = [int]$Matches[5]*3600 + [int]$Matches[6]*60 + [int]$Matches[7] + [int]$Matches[8]/1000 + $offset
-                $fmtTime = { param($t) $h=[int][math]::Floor($t/3600); $m=[int][math]::Floor(($t%%3600)/60); $s=[int][math]::Floor($t%%60); $ms=[int][math]::Round(($t%%1)*1000); "{0:D2}:{1:D2}:{2:D2},{3:D3}" -f $h,$m,$s,$ms }
+                $fmtTime = { param($t) $h=[int][math]::Floor($t/3600); $m=[int][math]::Floor(($t%%3600)/60); $s=[int][math]::Floor($t%%60); $ms=[int][math]::Floor(($t%%1)*1000); "{0:D2}:{1:D2}:{2:D2},{3:D3}" -f $h,$m,$s,$ms }
                 $shifted += "$(& $fmtTime $st) --> $(& $fmtTime $et)"
             } else {
                 $shifted += $srtLine
@@ -2904,13 +2984,13 @@ while ($true) {
     
     Set-Content -Path $status_file -Value "Transcribing... ($($completed.Count) chunks done)"
 }
-]], ai_dir, whisper_exe, model_bin, srt_out, done_flag, status_file, video_uri, abort_flag, seek_hint, chunks_done, chunk_ready, chunks_dir, model_name)
+]], pid_file, ai_dir, whisper_exe, model_bin, srt_out, done_flag, status_file, video_uri, abort_flag, seek_hint, chunks_done, chunk_ready, chunks_dir, model_name, lang_arg)
 
   f:write(ps_script)
   f:close()
 
-  -- Run powershell asynchronously
-  os.execute(string.format('start /b powershell -ExecutionPolicy Bypass -WindowStyle Hidden -File "%s"', ps1_file))
+  -- Run powershell asynchronously with BelowNormal priority to prevent VLC UI starvation
+  os.execute(string.format('start /b /belownormal powershell -ExecutionPolicy Bypass -WindowStyle Hidden -File "%s"', escape_cmd_win(ps1_file)))
 
   local init_input = vlc.object.input()
   local should_play_after_chunk = (vlc.playlist.status() == "playing")
@@ -2930,7 +3010,6 @@ while ($true) {
   end
 
   -- OSD Polling Loop
-  local input_obj = init_input
   local last_status = ""
   local last_known_time = (init_time or 0) / 1000000
   local is_paused_for_chunk = true  -- Start paused, waiting for first chunk
@@ -2939,26 +3018,52 @@ while ($true) {
   local last_live_size = 0          -- Track .live file size for cache invalidation
   local last_chunks_done_size = 0   -- Track chunks_done file size for cache invalidation
   while ai_is_running do
-      -- Check done flag (only written for finite sources)
+      -- Check done flag
       if ai_file_exists(done_flag) then break end
 
-      if vlc.misc and vlc.misc.mwait and vlc.misc.mdate then
-        -- Wait 0.5 seconds
-          vlc.misc.mwait(vlc.misc.mdate() + 500000)
+      -- 1. CLEAN SLEEP (Prevents Main VLC Player from lagging / CPU Starvation)
+      if vlc.mwait and vlc.mdate then
+          vlc.mwait(vlc.mdate() + 500000) -- Clean 500ms sleep at OS level (VLC 3+)
+      elseif vlc.misc and vlc.misc.mwait and vlc.misc.mdate then
+          vlc.misc.mwait(vlc.misc.mdate() + 500000) -- Clean 500ms sleep at OS level (VLC 2.x)
       else
-          local delay_start = os.clock()
-          while (os.clock() - delay_start) < 0.5 do end
+          -- Fallback: use a dummy network poll to sleep safely without flashing a window or burning CPU
+          local dummy_fds = nil
+          if vlc.net and vlc.net.listen_tcp then dummy_fds = vlc.net.listen_tcp("127.0.0.1", 0) end
+          if dummy_fds and dummy_fds[1] and vlc.net.poll then
+              vlc.net.poll({[dummy_fds[1]] = vlc.net.POLLIN}, 500)
+              pcall(vlc.net.close, dummy_fds[1])
+          else
+              local delay_start = os.clock()
+              while (os.clock() - delay_start) < 0.5 do end
+          end
       end
+      
+      if not ai_is_running then break end
       if vlc.keep_alive then vlc.keep_alive() end
+      if dlg and dlg.update then dlg:update() end
+      
+      -- 2. CHECK PLAYLIST STATUS FIRST (Prevents the crash on "Stop")
+      -- If you touch vlc.object.input() during teardown, VLC will immediately segfault.
+      local status = vlc.playlist.status()
+      if status == "stopped" or status == "unknown" then
+          ai_abort_transcription()
+          break
+      end
+      
+      -- 3. NOW IT IS SAFE TO FETCH INPUT AND ITEM
+      local current_input = vlc.object.input()
+      local current_item = vlc.input.item()
+      
+      if not current_input or not current_item then
+          ai_abort_transcription()
+          break
+      end
       
       -- Video switch detection
-      local current_item = vlc.input.item()
-      local current_uri = ""
-      if current_item then current_uri = current_item:uri() end
+      local current_uri = current_item:uri()
       if current_uri ~= video_uri then
-          local af = io.open(abort_flag, "w")
-          if af then af:write("ABORT"); af:close() end
-          ai_is_running = false
+          ai_abort_transcription()
           break
       end
       
@@ -2980,8 +3085,8 @@ while ($true) {
           end
       end
       
-      -- Get current playback time
-      local current_time = vlc.var.get(input_obj, "time")
+      -- Fetch the time using the validated input
+      local current_time = vlc.var.get(current_input, "time")
       if current_time then
           current_time = current_time / 1000000
           
@@ -3082,9 +3187,14 @@ while ($true) {
   end
 
   ai_is_running = false
+  if input_table and input_table['ai_start'] then
+      input_table['ai_start']:set_text("🎙️ Transcribe")
+  end
 
   -- Signal completion (no SRT file produced — OSD-only transcription)
-  vlc.osd.message("AI Transcription Complete!", ai_osd_ch_status, "top-right", 4000000)
+  if vlc.input.item() then
+      vlc.osd.message("AI Transcription Complete!", ai_osd_ch_status, "top-right", 4000000)
+  end
   if input_table and input_table['ai_status'] then
       input_table['ai_status']:set_text("Completed!")
   end
@@ -3096,14 +3206,51 @@ while ($true) {
   os.remove(seek_hint)
   os.remove(chunks_done)
   os.remove(chunk_ready)
-  os.execute('powershell -WindowStyle Hidden -Command "Remove-Item -Recurse -Force \'' .. chunks_dir .. '\' -ErrorAction SilentlyContinue"')
+  os.execute('powershell -WindowStyle Hidden -Command "Remove-Item -Recurse -Force \'' .. escape_powershell(chunks_dir) .. '\' -ErrorAction SilentlyContinue"')
 end
 
 function ai_start_transcription_proxy()
-  if not input_table or not input_table['ai_model'] or not input_table['ai_status'] then return end
-  ai_start_transcription(input_table['ai_model']:get_value(), input_table['ai_status'])
+  if ai_is_running then
+    ai_abort_transcription()
+    return
+  end
+
+  if not input_table or not input_table['ai_status'] then return end
+
+  if input_table['ai_language_main'] then
+    local sel_val = input_table['ai_language_main']:get_value()
+    local sel_cf = select_conf['ai_language_main']
+    if sel_val > 0 and sel_cf and sel_cf.cf[sel_val] then
+      openSub.option.ai_language = sel_cf.cf[sel_val][1]
+      save_config()
+    end
+  end
+
+  ai_start_transcription(input_table['ai_status'])
 end
 
+function get_filtered_ai_languages(ignore_model_filter)
+  local whisper_langs = {en=true, zh=true, de=true, es=true, ru=true, ko=true, fr=true, ja=true, pt=true, tr=true, pl=true, ca=true, nl=true, ar=true, sv=true, it=true, id=true, hi=true, fi=true, vi=true, he=true, uk=true, el=true, ms=true, cs=true, ro=true, da=true, hu=true, ta=true, no=true, th=true, ur=true, hr=true, bg=true, lt=true, la=true, mi=true, ml=true, cy=true, sk=true, te=true, fa=true, lv=true, bn=true, sr=true, az=true, sl=true, kn=true, et=true, mk=true, br=true, eu=true, is=true, hy=true, ne=true, mn=true, bs=true, kk=true, sq=true, sw=true, gl=true, mr=true, pa=true, si=true, km=true, sn=true, yo=true, so=true, af=true, oc=true, ka=true, be=true, tg=true, sd=true, gu=true, am=true, yi=true, lo=true, uz=true, fo=true, ht=true, ps=true, tk=true, nn=true, mt=true, sa=true, lb=true, my=true, bo=true, tl=true, mg=true, as=true, tt=true, haw=true, ln=true, ha=true, ba=true, jv=true, su=true}
+  local ai_model = openSub.option.ai_model or "tiny"
+  local is_en_only = (not ignore_model_filter) and (string.match(ai_model, "%.en$") ~= nil)
+  
+  local filtered = {}
+  if openSub.conf.languages then
+    for _, l in ipairs(openSub.conf.languages) do
+      local code = l[1]
+      local base_code = string.sub(string.lower(code), 1, 2)
+      
+      if is_en_only then
+        if base_code == "en" then
+          table.insert(filtered, l)
+        end
+      elseif whisper_langs[base_code] then
+        table.insert(filtered, l)
+      end
+    end
+  end
+  return filtered
+end
 
 -- Modified interface_main function - update the help button to pass window context
 function interface_main()
@@ -3135,10 +3282,8 @@ function interface_main()
     searchSubSourceDirect, 6, 3, 1, 1)
 
   -- AI Transcription UI
-  dlg:add_label("AI Model:", 5, 4, 1, 1)
-  input_table['ai_model'] = dlg:add_dropdown(6, 4, 1, 1)
-  input_table['ai_model']:add_value("tiny.en", 1)
-  input_table['ai_model']:add_value("base.en", 2)
+  dlg:add_label("AI Language:", 5, 4, 1, 1)
+  input_table['ai_language_main'] = dlg:add_dropdown(6, 4, 1, 1)
   input_table['ai_start'] = dlg:add_button("🎙️ Transcribe", ai_start_transcription_proxy, 6, 5, 1, 1)
   input_table['ai_status'] = dlg:add_label("Ready", 6, 6, 1, 1)
 
@@ -3190,6 +3335,7 @@ function interface_main()
   assoc_select_conf('language', 'language', openSub.conf.languages, 2, lang["int_all"])
   assoc_select_conf('language2', 'language2', openSub.conf.languages, 2, 'None')
   assoc_select_conf('language3', 'language3', openSub.conf.languages, 2, 'None')
+  assoc_select_conf('ai_language_main', 'ai_language', get_filtered_ai_languages(), 2, 'Auto')
   assoc_select_conf('sort_by', 'sortBy', openSub.conf.sortByOptions, 2, 'Default')
   assoc_select_conf('sort_direction', 'sortDirection', openSub.conf.sortDirectionOptions, 2)
 
@@ -3236,63 +3382,71 @@ function interface_config()
   dlg:add_label(lang["int_third_lang"]..":", 1, 6, 2, 1)
   input_table['default_language3'] = dlg:add_dropdown(3, 6, 1, 1)
 
-  -- Row 7: Download behavior
-  dlg:add_label(lang["int_dowload_behav"]..":", 1, 7, 2, 1)
-  input_table['downloadBehaviour'] = dlg:add_dropdown(3, 7, 1, 1)
+  -- Row 7: AI Model
+  dlg:add_label("AI Model:", 1, 7, 2, 1)
+  input_table['ai_model'] = dlg:add_dropdown(3, 7, 1, 1)
 
-  -- Row 8: Display language code
-  dlg:add_label(lang["int_display_code"]..":", 1, 8, 2, 1)
-  input_table['langExt'] = dlg:add_dropdown(3, 8, 1, 1)
+  -- Row 8: Download behavior
+  dlg:add_label(lang["int_dowload_behav"]..":", 1, 8, 2, 1)
+  input_table['downloadBehaviour'] = dlg:add_dropdown(3, 8, 1, 1)
 
-  -- Row 9: Remove tags
-  dlg:add_label(lang["int_remove_tag"]..":", 1, 9, 2, 1)
-  input_table['removeTag'] = dlg:add_dropdown(3, 9, 1, 1)
+  -- Row 9: AI Transcription Language
+  dlg:add_label("AI Transcribe Language:", 1, 9, 2, 1)
+  input_table['ai_language_cfg'] = dlg:add_dropdown(3, 9, 1, 1)
 
-  -- Row 10: Working directory
+  -- Row 10: Display language code
+  dlg:add_label(lang["int_display_code"]..":", 1, 10, 2, 1)
+  input_table['langExt'] = dlg:add_dropdown(3, 10, 1, 1)
+
+  -- Row 11: Remove tags
+  dlg:add_label(lang["int_remove_tag"]..":", 1, 11, 2, 1)
+  input_table['removeTag'] = dlg:add_dropdown(3, 11, 1, 1)
+
+  -- Row 12: Working directory
   if openSub.conf.dirPath then
     if openSub.conf.os == "lin" then
-      dlg:add_label(lang["int_vlsub_work_dir"], 1, 10, 2, 1)
+      dlg:add_label(lang["int_vlsub_work_dir"], 1, 12, 2, 1)
     elseif openSub.conf.os == "win" then
       dlg:add_label(
         "<a href='file:///"..openSub.conf.dirPath.."'>"..
-        lang["int_vlsub_work_dir"].."</a>", 1, 10, 2, 1)
+        lang["int_vlsub_work_dir"].."</a>", 1, 12, 2, 1)
     else
       dlg:add_label(
         "<a href='"..openSub.conf.dirPath.."'>"..
-        lang["int_vlsub_work_dir"].."</a>", 1, 10, 2, 1)
+        lang["int_vlsub_work_dir"].."</a>", 1, 12, 2, 1)
     end
   else
-    dlg:add_label(lang["int_vlsub_work_dir"], 1, 10, 2, 1)
+    dlg:add_label(lang["int_vlsub_work_dir"], 1, 12, 2, 1)
   end
 
   input_table['dir_path'] = dlg:add_text_input(
-    openSub.conf.dirPath, 2, 10, 2, 1)
+    openSub.conf.dirPath, 2, 12, 2, 1)
 
-  -- Row 11: OpenSubtitles status message
+  -- Row 13: OpenSubtitles status message
   input_table['message'] = nil
-  input_table['message'] = dlg:add_label('', 1, 11, 4, 1)
+  input_table['message'] = dlg:add_label('', 1, 13, 4, 1)
 
-  -- Row 12: SubSource status message
+  -- Row 14: SubSource status message
   input_table['subsource_message'] = nil
-  input_table['subsource_message'] = dlg:add_label('', 1, 12, 4, 1)
+  input_table['subsource_message'] = dlg:add_label('', 1, 14, 4, 1)
 
-  -- Row 13: Action buttons
+  -- Row 15: Action buttons
   dlg:add_button(
     "💾 " .. lang["int_save"],
-    apply_config, 1, 13, 1, 1)
+    apply_config, 1, 15, 1, 1)
 
   dlg:add_button(
     "❓ " .. lang["int_help"],
     function() show_help("config") end,
-    2, 13, 1, 1)
+    2, 15, 1, 1)
 
   dlg:add_button(
     "🔄 Check Updates",
-    function() check_for_updates(true) end, 3, 13, 1, 1)
+    function() check_for_updates(true) end, 3, 15, 1, 1)
 
   dlg:add_button(
     "❌ " .. lang["int_close"],
-    show_main, 4, 13, 1, 1)
+    show_main, 4, 15, 1, 1)
 
   -- Setup dropdown values for existing dropdowns
   input_table['langExt']:add_value(
@@ -3309,6 +3463,8 @@ function interface_config()
   assoc_select_conf('default_language', 'language', openSub.conf.languages, 2, lang["int_all"])
   assoc_select_conf('default_language2', 'language2', openSub.conf.languages, 2, 'None')
   assoc_select_conf('default_language3', 'language3', openSub.conf.languages, 2, 'None')
+  assoc_select_conf('ai_model', 'ai_model', {{"tiny", "Tiny (Multi)"}, {"base", "Base (Multi)"}, {"tiny.en", "Tiny (English Only)"}, {"base.en", "Base (English Only)"}}, 2, "Tiny (Multi)")
+  assoc_select_conf('ai_language_cfg', 'ai_language', get_filtered_ai_languages(true), 2, 'Auto')
   assoc_select_conf('downloadBehaviour', 'downloadBehaviour', openSub.conf.downloadBehaviours, 1)
 end
 
@@ -3570,7 +3726,7 @@ end
 
 function close_dlg()
   vlc.msg.dbg("[VLSub] Closing dialog")
-
+  ai_abort_transcription()
   if dlg ~= nil then
     --~ dlg:delete() -- Throw an error
     dlg:hide()
@@ -6455,10 +6611,10 @@ function list_dir(path)
 
     if openSub.conf.os == "win" then
       -- Silent Windows directory listing
-      dir_list_cmd = io.popen('dir /b "' .. path .. '" 2>nul')
+      dir_list_cmd = io.popen('dir /b "' .. escape_cmd_win(path) .. '" 2>nul')
     else
       -- Silent Unix directory listing
-      dir_list_cmd = io.popen('ls -1 "' .. path .. '" 2>/dev/null')
+      dir_list_cmd = io.popen('ls -1 "' .. escape_cmd_posix(path) .. '" 2>/dev/null')
     end
 
     if dir_list_cmd then
@@ -6542,9 +6698,9 @@ function mkdir_p(path)
   -- Method 3: Fallback to silent OS commands only if VLC methods fail
   if not is_dir(path) then
     if openSub.conf.os == "win" then
-      os.execute('mkdir "' .. path .. '" >nul 2>&1')
+      os.execute('mkdir "' .. escape_cmd_win(path) .. '" >nul 2>&1')
     else
-      os.execute("mkdir -p '" .. path .. "' >/dev/null 2>&1")
+      os.execute("mkdir -p '" .. escape_cmd_posix(path) .. "' >/dev/null 2>&1")
     end
   end
 
