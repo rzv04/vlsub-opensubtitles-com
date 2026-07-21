@@ -1,6 +1,6 @@
 --[[
 ================================================================================
-VLSub OpenSubtitles.com Extension for VLC Media Player 3.0+
+VLSub OpenSubtitles.com + SubSource Extension for VLC Media Player 3.0+
 ================================================================================
 
 DESCRIPTION:
@@ -177,6 +177,7 @@ local options = {
   language = nil,
   language2 = nil,  -- Second language
   language3 = nil,  -- Third language
+  subsource_api_key = nil, -- SubSource API key
   sortBy = nil,     -- API order_by
   sortDirection = "desc", -- API order_direction
   downloadBehaviour = 'save',
@@ -214,16 +215,18 @@ local options = {
     int_help = 'Help',
     int_search_hash = 'Search by hash',
     int_search_name = 'Search',
+    int_search_subsource = 'Search (SubSource)',
     int_title = 'Title',
     int_season = 'TV Season',
     int_episode = 'TV Episode',
-    int_imdb = 'IMDB ID',
+    int_imdb = 'IMDB ID (Movies)',
     int_show_help = 'Help',
     int_show_conf = 'Config',
     int_dowload_sel = 'Download selected',
     int_close = 'Close',
     int_ok = 'Ok',
     int_save = 'Save',
+    int_here = 'Here',
     int_cancel = 'Cancel',
     int_bool_true = 'Yes',
     int_bool_false = 'No',
@@ -241,8 +244,10 @@ local options = {
     int_remove_tag = 'Remove tags',
     int_use_curl = 'Use curl (<a href="https://github.com/opensubtitles/vlsub-opensubtitles-com/wiki/VLC-Extension-Development-FAQ:-Networking-and-Header-Limitations">info</a>)',
     int_vlsub_work_dir = 'VLSub working directory',
+    int_subsource_api_key_info = 'You can find your SubSource API Key ',
     int_os_username = 'OpenSubtitles.com Username',
     int_os_password = 'OpenSubtitles.com Password',
+    int_subsource_api_key = 'SubSource API Key (Optional)',
     int_help_mess =[[
       Download subtitles from
       <a href='http://www.opensubtitles.org/'>
@@ -969,6 +974,22 @@ function compare_versions(version1, version2)
   return 0
 end
 
+-- Utility functions for safe OS command execution
+local function escape_cmd_win(str)
+  if not str then return "" end
+  return str:gsub('"', '')
+end
+
+local function escape_cmd_posix(str)
+  if not str then return "" end
+  return str:gsub("'", "'\\''")
+end
+
+local function escape_powershell(str)
+  if not str then return "" end
+  return str:gsub("'", "''")
+end
+
 -- Function to get installation instructions for the user's OS
 function get_install_instructions(download_url)
   local instructions = {}
@@ -1157,13 +1178,13 @@ function process_release_notes(notes)
 
   -- Split into individual features and clean up
   local features = {}
-  for line in processed:gmatch("[^\n]+") do
-    line = string.gsub(line, "^%s*", "") -- Remove leading spaces
-    line = string.gsub(line, "%s*$", "") -- Remove trailing spaces
+  for raw_line in processed:gmatch("[^\n]+") do
+    local clean_line = string.gsub(raw_line, "^%s*", "") -- Remove leading spaces
+    clean_line = string.gsub(clean_line, "%s*$", "") -- Remove trailing spaces
 
     -- Skip empty lines and section headers
-    if line ~= "" and not string.match(line, "^[A-Z][a-z]+%s*$") then
-      table.insert(features, line)
+    if clean_line ~= "" and not string.match(clean_line, "^[A-Z][a-z]+%s*$") then
+      table.insert(features, clean_line)
     end
   end
 
@@ -1697,11 +1718,12 @@ end
 
 
 function close()
-  vlc.deactivate()
+  ai_abort_transcription()
 end
 
 function deactivate()
   vlc.msg.dbg("[VLsub] Bye bye!")
+  ai_abort_transcription()
   if dlg then
     dlg:hide()
   end
@@ -1727,9 +1749,1508 @@ function meta_changed()
 end
 
 
-            --[[ Interface data ]]--
+-- SubSource API Integration Engine
+-- SubSource API Integration Engine
+subSource = {}
+subSource.base_url = "https://api.subsource.net/api/v1"
 
+subSource.limits = {
+  minute = { max = 60 },
+  hour = { max = 1800 },
+  day = { max = 7200 }
+}
 
+subSource.paginationState = nil
+
+function clear_pagination_state()
+  subSource.paginationState = nil
+end
+
+function subSource.trackRequest()
+  local now = os.time()
+  if type(openSub.option.subSourceLimits) ~= "table" then
+    openSub.option.subSourceLimits = {
+      minute = { count = 0, resets_at = 0 },
+      hour = { count = 0, resets_at = 0 },
+      day = { count = 0, resets_at = 0 }
+    }
+  end
+  local limits = openSub.option.subSourceLimits
+  if limits.minute.resets_at <= now then
+    limits.minute.count = 0
+    limits.minute.resets_at = now + 60
+  end
+  if limits.hour.resets_at <= now then
+    limits.hour.count = 0
+    limits.hour.resets_at = now + 3600
+  end
+  if limits.day.resets_at <= now then
+    limits.day.count = 0
+    limits.day.resets_at = now + 86400
+  end
+  limits.minute.count = limits.minute.count + 1
+  limits.hour.count = limits.hour.count + 1
+  limits.day.count = limits.day.count + 1
+  -- Don't call save_config() here on every single request because it causes lag.
+  -- We'll save_config() after the search is completely done.
+end
+
+function subSource.getLimitsString()
+  if type(openSub.option.subSourceLimits) ~= "table" then return "" end
+  local limits = openSub.option.subSourceLimits
+  local m = math.max(0, subSource.limits.minute.max - limits.minute.count)
+  local h = math.max(0, subSource.limits.hour.max - limits.hour.count)
+  local d = math.max(0, subSource.limits.day.max - limits.day.count)
+  return string.format(" | API limits remaining: min(%d) hr(%d) day(%d)", m, h, d)
+end
+
+function subSource.validateKey(api_key)
+  if not api_key or trim(api_key) == "" then
+    return false, "SubSource API Key is empty"
+  end
+
+  -- api_key in query string is the only auth method that works reliably with vlc.stream
+  -- (vlc.stream converts headers to URL params, which SubSource rejects)
+  local test_url = build_sorted_url(subSource.base_url .. "/movies/search", { searchType = "text", q = "test", api_key = trim(api_key) })
+  local client = Curl.new()
+  client:set_timeout(10)
+  client:set_retries(1)
+
+  subSource.trackRequest()
+  local res = client:get(test_url)
+  if not res then
+    return false, "SubSource server did not respond"
+  end
+
+  if res.status == 200 then
+    return true, "SubSource API Key validated successfully!"
+  elseif res.status == 401 or res.status == 403 then
+    return false, "Invalid SubSource API Key (HTTP " .. tostring(res.status) .. ")"
+  else
+    return false, "SubSource API returned status " .. tostring(res.status)
+  end
+end
+
+function subSource.convertResponse(parsed_data, default_title)
+  local results = {}
+  local raw_items = {}
+
+  if type(parsed_data) == "table" then
+    if parsed_data.data and type(parsed_data.data) == "table" then
+      raw_items = parsed_data.data
+    elseif #parsed_data > 0 then
+      raw_items = parsed_data
+    elseif parsed_data.subtitles and type(parsed_data.subtitles) == "table" then
+      raw_items = parsed_data.subtitles
+    end
+  end
+
+  -- Language name to ISO code mapping lookup
+  local lang_name_map = {
+    english = "en", eng = "en",
+    romanian = "ro", rum = "ro",
+    french = "fr", fre = "fr", fra = "fr",
+    spanish = "es", spa = "es",
+    german = "de", ger = "de", deu = "de",
+    italian = "it", ita = "it",
+    portuguese = "pt", por = "pt", pob = "pt-br",
+    russian = "ru", rus = "ru",
+    dutch = "nl", dut = "nl", nld = "nl",
+    polish = "pl", pol = "pl",
+    turkish = "tr", tur = "tr",
+    arabic = "ar", ara = "ar",
+    greek = "el", ell = "el", gre = "el",
+    czech = "cs", cze = "cs", ces = "cs",
+    hungarian = "hu", hun = "hu",
+    swedish = "sv", swe = "sv",
+    danish = "da", dan = "da",
+    finnish = "fi", fin = "fi",
+    norwegian = "no", nor = "no",
+    hebrew = "he", heb = "he",
+    japanese = "ja", jpn = "ja",
+    korean = "ko", kor = "ko",
+    chinese = "zh", chi = "zh", zho = "zh"
+  }
+
+  for _, item in ipairs(raw_items) do
+    local sub_id = item.subtitleId or item.id or item.sub_id or item.subtitle_id
+    if sub_id then
+      -- Build release name string from releaseInfo array, commentary, or fallback
+      local sub_name = nil
+      if item.releaseInfo and type(item.releaseInfo) == "table" and #item.releaseInfo > 0 then
+        local title_prefix = (default_title and default_title ~= "") and (default_title .. ".") or ""
+        sub_name = title_prefix .. table.concat(item.releaseInfo, ".") .. ".srt"
+      elseif item.full_name or item.release_name or item.filename or item.name then
+        sub_name = item.full_name or item.release_name or item.filename or item.name
+      elseif item.commentary and item.commentary ~= "" then
+        sub_name = (default_title or "subtitle") .. " (" .. item.commentary .. ").srt"
+      else
+        sub_name = (default_title or "subtitle") .. ".srt"
+      end
+
+      -- Map language name/code
+      local raw_lang = string.lower(tostring(item.language or item.lang or item.language_code or "en"))
+      local lang_code = lang_name_map[raw_lang] or (string.len(raw_lang) <= 3 and raw_lang or string.sub(raw_lang, 1, 2))
+
+      -- Detect HD quality from releaseInfo, releaseType, or productionType
+      local is_hd = false
+      if item.hd ~= nil then
+        is_hd = item.hd
+      else
+        local combined_info = ""
+        if item.releaseInfo and type(item.releaseInfo) == "table" then
+          combined_info = table.concat(item.releaseInfo, " ")
+        end
+        if item.productionType then combined_info = combined_info .. " " .. tostring(item.productionType) end
+        if item.releaseType then combined_info = combined_info .. " " .. tostring(item.releaseType) end
+        combined_info = string.lower(combined_info)
+        if string.find(combined_info, "1080p") or string.find(combined_info, "720p") or string.find(combined_info, "4k") or string.find(combined_info, "2160p") or string.find(combined_info, "bluray") then
+          is_hd = true
+        end
+      end
+
+      -- Extract hearing impaired flag (supports camelCase hearingImpaired and snake_case hearing_impaired)
+      local is_hi = false
+      if item.hearingImpaired ~= nil then
+        is_hi = item.hearingImpaired
+      elseif item.hearing_impaired ~= nil then
+        is_hi = item.hearing_impaired
+      end
+
+      -- Extract uploader name from contributors array or uploaderId
+      local uploader = "SubSource"
+      if item.contributors and type(item.contributors) == "table" and #item.contributors > 0 then
+        local contrib = item.contributors[1]
+        if type(contrib) == "table" and contrib.displayname then
+          uploader = contrib.displayname
+        end
+      elseif item.uploader and type(item.uploader) == "table" and item.uploader.name then
+        uploader = item.uploader.name
+      elseif item.uploaderId then
+        uploader = "User #" .. tostring(item.uploaderId)
+      end
+
+      -- Extract upload date (createdAt, upload_date, created_at)
+      local upload_date = item.createdAt or item.upload_date or item.created_at or ""
+      local dl_cnt = item.downloads or item.download_count or 0
+
+      table.insert(results, {
+        Provider = "SubSource",
+        SubtitleID = tostring(sub_id),
+        FileID = tostring(sub_id),
+        SubFileName = sub_name,
+        SubLanguageID = lang_code,
+        SubDownloadsCnt = tostring(dl_cnt),
+        HearingImpaired = is_hi,
+        HD = is_hd,
+        FromTrusted = true,
+        UploaderName = uploader,
+        UploadDate = upload_date,
+        url = item.download_url or ("https://subsource.net/subtitles/" .. tostring(sub_id))
+      })
+    end
+  end
+
+  return results
+end
+
+function subSource.search(movie_title, languages_str, season, episode, imdb_id, year, is_hash, is_show_more)
+  local api_key = trim(openSub.option.subsource_api_key or "")
+  if api_key == "" then
+    vlc.msg.dbg("[SubSource] Search skipped - no API key provided")
+    return {}
+  end
+
+  local state
+  if is_show_more and subSource.paginationState then
+    state = subSource.paginationState
+  else
+    state = {
+      target_movie_ids = {},
+      current_movie_idx = 1,
+      next_page = 1,
+      movie_title = movie_title,
+      languages_str = languages_str,
+      season = season,
+      episode = episode,
+      imdb_id = imdb_id,
+      year = year,
+      is_hash = is_hash,
+      accumulated_results = {},
+      has_more = false,
+      last_filtered_count = 0
+    }
+    subSource.paginationState = state
+  end
+
+  local season_num = state.season and tonumber(state.season)
+  local episode_num = state.episode and tonumber(state.episode)
+
+  -- Language mapping from code to full name for SubSource API
+  local lang_code_to_name = {
+    en = "english", eng = "english",
+    ro = "romanian", rum = "romanian",
+    fr = "french", fre = "french",
+    es = "spanish", spa = "spanish",
+    de = "german", ger = "german",
+    it = "italian", ita = "italian",
+    pt = "portuguese", por = "portuguese", pob = "portuguese",
+    ru = "russian", rus = "russian",
+    nl = "dutch", dut = "dutch",
+    pl = "polish", pol = "polish",
+    tr = "turkish", tur = "turkish",
+    ar = "arabic", ara = "arabic",
+    el = "greek", ell = "greek",
+    cs = "czech", cze = "czech",
+    hu = "hungarian", hun = "hungarian",
+    sv = "swedish", swe = "swedish",
+    da = "danish", dan = "danish",
+    fi = "finnish", fin = "finnish",
+    no = "norwegian", nor = "norwegian"
+  }
+
+  local full_lang_name = nil
+  if state.languages_str and state.languages_str ~= "" and state.languages_str ~= "all" then
+    local mapped_langs = {}
+    for l in string.gmatch(state.languages_str, "([^,]+)") do
+      local lower_l = string.lower(l)
+      table.insert(mapped_langs, lang_code_to_name[lower_l] or lower_l)
+    end
+    full_lang_name = table.concat(mapped_langs, ",")
+  end
+
+  local client = Curl.new()
+  -- No headers: vlc.stream (HTTPS) converts them to URL params which SubSource rejects
+  client:set_timeout(25)
+  client:set_retries(2)
+
+  if not is_show_more then
+    -- Collect all movie entries (SubSource may paginate movie results too)
+    local movie_entries = {}
+
+    local function fetch_movie_entries(query)
+      local url = build_sorted_url(subSource.base_url .. "/movies/search", {
+        searchType = "text", q = query, api_key = api_key
+      })
+      vlc.msg.dbg("[SubSource] Movie search: " .. string.gsub(url, "api_key=[^&]+", "api_key=***"))
+      subSource.trackRequest()
+      local r = client:get(url)
+      if r and (r.status == 401 or r.status == 403) then
+        setMessage(error_tag("Auth failed: Incorrect SubSource API key."))
+      end
+      if r and r.status == 200 and r.body then
+        vlc.msg.dbg("[SubSource] Movie search response: " .. string.sub(r.body, 1, 800))
+        local ok, parsed = pcall(json.decode, r.body, 1, true)
+        if ok and parsed and parsed.data and type(parsed.data) == "table" then
+          for _, entry in ipairs(parsed.data) do
+            vlc.msg.dbg("[SubSource] Movie entry: id=" .. tostring(entry.movieId or entry.id) .. " season=" .. tostring(entry.season) .. " title=" .. tostring(entry.title))
+            table.insert(movie_entries, entry)
+          end
+        end
+      end
+    end
+
+    if state.imdb_id and state.imdb_id ~= "" then
+      local url = build_sorted_url(subSource.base_url .. "/movies/search", {
+        searchType = "imdb", imdb = state.imdb_id, api_key = api_key
+      })
+      vlc.msg.dbg("[SubSource] IMDb search: " .. string.gsub(url, "api_key=[^&]+", "api_key=***"))
+      subSource.trackRequest()
+      local r = client:get(url)
+      if r and (r.status == 401 or r.status == 403) then
+        setMessage(error_tag("Auth failed: Incorrect SubSource API key."))
+      end
+      if r and r.status == 200 and r.body then
+        local ok, parsed = pcall(json.decode, r.body, 1, true)
+        if ok and parsed and parsed.data and type(parsed.data) == "table" then
+          for _, entry in ipairs(parsed.data) do
+            vlc.msg.dbg("[SubSource] IMDb movie entry: id=" .. tostring(entry.movieId or entry.id) .. " season=" .. tostring(entry.season))
+            table.insert(movie_entries, entry)
+          end
+        end
+      end
+    end
+
+    if #movie_entries == 0 and state.movie_title and state.movie_title ~= "" then
+      fetch_movie_entries(state.movie_title)
+    end
+
+    if #movie_entries == 0 then
+      vlc.msg.dbg("[SubSource] No movie entries found for: " .. tostring(state.movie_title))
+      state.has_more = false
+      return {}
+    end
+
+    -- Step 2: Pick the best matching movieId(s)
+    local target_movie_ids = {}
+    if season_num and season_num > 0 then
+      -- Try exact season match first
+      for _, entry in ipairs(movie_entries) do
+        local entry_season = tonumber(entry.season)
+        if entry_season and entry_season == season_num then
+          local mid = entry.movieId or entry.id
+          if mid then
+            vlc.msg.dbg("[SubSource] Season-matched movieId: " .. tostring(mid) .. " (season=" .. tostring(entry_season) .. ")")
+            table.insert(target_movie_ids, tostring(mid))
+          end
+        end
+      end
+    end
+
+    -- Fall back to all entries if no season match
+    if #target_movie_ids == 0 then
+      vlc.msg.dbg("[SubSource] No season-specific match, using all " .. #movie_entries .. " entries")
+      for _, entry in ipairs(movie_entries) do
+        local mid = entry.movieId or entry.id
+        if mid then table.insert(target_movie_ids, tostring(mid)) end
+      end
+    end
+    state.target_movie_ids = target_movie_ids
+  end
+
+  local new_matches = 0
+  state.has_more = false
+
+  -- Helper function to filter accumulated results
+  local function get_filtered_results(results_list)
+    if #results_list == 0 then return {} end
+    if not season_num or season_num <= 0 then
+      return results_list
+    end
+    local filtered = {}
+    local s_padded = string.format("%02d", season_num)
+    local e_padded = episode_num and episode_num > 0 and string.format("%02d", episode_num) or nil
+
+    for _, item in ipairs(results_list) do
+      local fname = string.upper(item.SubFileName or "")
+      local matched = false
+
+      local has_season = string.find(fname, string.format("S%s", s_padded), 1, true) ~= nil
+                      or string.find(fname, string.format("%dX", season_num), 1, true) ~= nil
+                      or string.find(fname, string.format("%dE", season_num), 1, true) ~= nil
+
+      if has_season then
+        if e_padded then
+          local has_any_ep = string.find(fname, string.format("S%sE", s_padded), 1, true) ~= nil
+                          or string.find(fname, string.format("%dE", season_num), 1, true) ~= nil
+          if has_any_ep then
+            matched = string.find(fname, string.format("E%s", e_padded), 1, true) ~= nil
+                   or string.find(fname, string.format("E0*%d[^0-9]", episode_num)) ~= nil
+          else
+            matched = true  -- season pack covers all episodes
+          end
+        else
+          matched = true
+        end
+      end
+
+      if matched then table.insert(filtered, item) end
+    end
+
+    -- If episode filter removed everything, fall back to season-level results (season packs)
+    if #filtered == 0 and e_padded then
+      for _, item in ipairs(results_list) do
+        local fname = string.upper(item.SubFileName or "")
+        if string.find(fname, string.format("S%s", s_padded), 1, true) then
+          table.insert(filtered, item)
+        end
+      end
+    end
+    return filtered
+  end
+
+  -- Step 3: Fetch subtitles for target movieIds
+  while state.current_movie_idx <= #state.target_movie_ids do
+    local mid = state.target_movie_ids[state.current_movie_idx]
+    local params = { movieId = mid, api_key = api_key, page = tostring(state.next_page) }
+    if full_lang_name then params["language"] = full_lang_name end
+    local url = build_sorted_url(subSource.base_url .. "/subtitles", params)
+    vlc.msg.dbg("[SubSource] subtitles movieId=" .. mid .. " page=" .. state.next_page .. ": " .. string.gsub(url, "api_key=[^&]+", "api_key=***"))
+    
+    subSource.trackRequest()
+    local r = client:get(url)
+    if not r or r.status ~= 200 or not r.body then break end
+    
+    local ok, parsed = pcall(json.decode, r.body, 1, true)
+    if not ok or not parsed then break end
+    
+    local items = subSource.convertResponse(parsed, state.movie_title)
+    for _, v in ipairs(items) do
+      table.insert(state.accumulated_results, v)
+    end
+    vlc.msg.dbg("[SubSource] movieId=" .. mid .. " page=" .. state.next_page .. " → " .. #items .. " items (total api: " .. tostring(parsed.pagination and parsed.pagination.total) .. ")")
+    
+    local filtered = get_filtered_results(state.accumulated_results)
+    new_matches = #filtered - state.last_filtered_count
+    
+    local total_pages = parsed.pagination and (parsed.pagination.pages or (parsed.pagination.total and math.ceil(parsed.pagination.total / 20))) or 1
+    
+    -- Increment page/movie idx
+    if state.next_page >= total_pages then
+      state.current_movie_idx = state.current_movie_idx + 1
+      state.next_page = 1
+    else
+      state.next_page = state.next_page + 1
+    end
+    
+    -- Update has_more
+    if state.current_movie_idx <= #state.target_movie_ids then
+      state.has_more = true
+    else
+      state.has_more = false
+    end
+
+    if new_matches >= 20 then
+      break
+    end
+
+    -- Delay between loops
+    if state.current_movie_idx <= #state.target_movie_ids then
+      if vlc.misc and vlc.misc.mwait and vlc.misc.mdate then
+        vlc.misc.mwait(vlc.misc.mdate() + 250000)
+      else
+        local delay_start = os.clock()
+        while (os.clock() - delay_start) < 0.25 do end
+      end
+    end
+  end
+
+  local final_filtered = get_filtered_results(state.accumulated_results)
+  local new_filtered = {}
+  for i = state.last_filtered_count + 1, #final_filtered do
+    table.insert(new_filtered, final_filtered[i])
+  end
+  state.last_filtered_count = #final_filtered
+
+  vlc.msg.dbg("[SubSource] Search page loop finished. New matching: " .. #new_filtered .. " Total matching: " .. #final_filtered .. " has_more=" .. tostring(state.has_more))
+  return new_filtered
+end
+
+-- Score an SRT filename against requested season/episode (higher = better match)
+local function score_srt_for_episode(fname, season_num, episode_num)
+  local upper = string.upper(fname)
+  local score = 0
+  if season_num and season_num > 0 then
+    local s_padded = string.format("%02d", season_num)
+    -- Season match
+    if string.find(upper, string.format("S%s", s_padded), 1, true) or
+       string.find(upper, string.format("%dX", season_num), 1, true) or
+       string.find(upper, string.format("%dE", season_num), 1, true) then
+      score = score + 10
+    else
+      return -1  -- wrong season entirely
+    end
+    if episode_num and episode_num > 0 then
+      local e_padded = string.format("%02d", episode_num)
+      -- Exact episode match
+      if string.find(upper, string.format("E%s", e_padded), 1, true) or
+         string.find(upper, string.format("E0*%d[^0-9]", episode_num)) then
+        score = score + 20  -- individual episode file — highest priority
+      elseif string.find(upper, string.format("S%sE", s_padded), 1, true) or
+             string.find(upper, string.format("%dE", season_num), 1, true) then
+        return -1  -- different episode
+      else
+        score = score + 5  -- season pack — lower priority than individual episode
+      end
+    end
+  end
+  return score
+end
+
+function subSource.downloadSubtitle(item)
+  local api_key = trim(openSub.option.subsource_api_key or "")
+  if api_key == "" then
+    setMessage(error_tag("SubSource API key required for download."))
+    return false
+  end
+
+  local sub_id = item.FileID or item.SubtitleID
+  if not sub_id then
+    setMessage(error_tag("No SubSource subtitle ID available."))
+    return false
+  end
+
+  local download_url = build_sorted_url(subSource.base_url .. "/subtitles/" .. tostring(sub_id) .. "/download", { api_key = api_key })
+  vlc.msg.dbg("[SubSource] Downloading subtitle ID " .. tostring(sub_id) .. " from " .. string.gsub(download_url, "api_key=[^&]+", "api_key=***"))
+
+  local client = Curl.new()
+  client:set_timeout(30)
+  client:set_retries(2)
+
+  subSource.trackRequest()
+  local res = client:get(download_url, true) -- Pass true to prevent binary truncation
+  if not res or res.status ~= 200 or not res.body then
+    local status_str = res and tostring(res.status) or "no response"
+    setMessage(error_tag("SubSource download failed (HTTP " .. status_str .. ")"))
+    save_config()
+    return false
+  end
+
+  local raw_body = res.body
+
+  -- Check if we got a JSON redirect to the actual file
+  local ok, parsed = pcall(json.decode, raw_body, 1, true)
+  if ok and parsed and type(parsed) == "table" then
+    local link = parsed.download_url or parsed.link or parsed.url
+    if link then
+      vlc.msg.dbg("[SubSource] Got secondary download URL: " .. link)
+      local dl_res = client:get(link, true)
+      if dl_res and dl_res.status == 200 and dl_res.body then
+        raw_body = dl_res.body
+      end
+    elseif parsed.content then
+      raw_body = parsed.content
+    end
+  end
+
+  if not item.SubFormat then
+    local ext = string.match(item.SubFileName or "", "%.([^%.]+)$")
+    item.SubFormat = ext or "srt"
+  end
+
+  -- Detect ZIP by magic bytes PK\x03\x04
+  local is_zip = (string.sub(raw_body, 1, 2) == "PK")
+  vlc.msg.dbg("[SubSource] Downloaded " .. #raw_body .. " bytes, is_zip=" .. tostring(is_zip))
+
+  if not is_zip then
+    -- Plain SRT/text content
+    local success = openSub.saveAndLoadSubtitle(raw_body, item)
+    if success then setMessage(success_tag("Subtitle downloaded from SubSource!")) end
+    save_config()
+    return success
+  end
+
+  -- ---- ZIP handling ----
+  local is_windows = (package.config:sub(1,1) == "\\")
+  
+  -- Save ZIP to a temp file, extract, pick best SRT
+  local tmp_dir = is_windows and (os.getenv("TEMP") or os.getenv("TMP") or "C:\\Temp") or "/tmp"
+  local path_sep = is_windows and "\\" or "/"
+  
+  local zip_path = tmp_dir .. path_sep .. "vlsub_subsource_" .. tostring(sub_id) .. ".zip"
+  local extract_dir = tmp_dir .. path_sep .. "vlsub_subsource_" .. tostring(sub_id)
+
+  vlc.msg.dbg("[SubSource] Saving ZIP to: " .. zip_path)
+  local zf, err = io.open(zip_path, "wb")
+  if not zf then
+    setMessage(error_tag("Cannot write ZIP temp file: " .. tostring(err)))
+    return false
+  end
+  local ok, write_err = pcall(function()
+    zf:write(raw_body)
+    zf:flush()
+  end)
+  zf:close()
+  if not ok then
+    setMessage(error_tag("Failed to write to ZIP: " .. tostring(write_err)))
+    os.remove(zip_path)
+    return false
+  end
+
+  -- Extract ZIP
+  local ext_cmd = ""
+  if is_windows then
+    ext_cmd = string.format('powershell -WindowStyle Hidden -NoProfile -Command "Expand-Archive -LiteralPath \'%s\' -DestinationPath \'%s\' -Force"', escape_powershell(zip_path), escape_powershell(extract_dir))
+  else
+    ext_cmd = string.format("unzip -o '%s' -d '%s' > /dev/null 2>&1", escape_cmd_posix(zip_path), escape_cmd_posix(extract_dir))
+  end
+  vlc.msg.dbg("[SubSource] Extracting ZIP: " .. ext_cmd)
+  local ok_extract = os.execute(ext_cmd)
+  if not ok_extract then
+    setMessage(error_tag("Failed to extract SubSource ZIP"))
+    return false
+  end
+
+  -- List extracted SRT files
+  local list_cmd = ""
+  if is_windows then
+    list_cmd = string.format('powershell -WindowStyle Hidden -NoProfile -Command "Get-ChildItem -Path \'%s\' -Recurse -Include *.srt,*.sub,*.ass | Select-Object -ExpandProperty FullName"', escape_powershell(extract_dir))
+  else
+    list_cmd = string.format("find '%s' -type f \\( -iname \"*.srt\" -o -iname \"*.sub\" -o -iname \"*.ass\" \\)", escape_cmd_posix(extract_dir))
+  end
+  
+  local pipe = io.popen(list_cmd)
+  local srt_files = {}
+  if pipe then
+    for line in pipe:lines() do
+      local trimmed = line:match("^%s*(.-)%s*$")
+      if trimmed and trimmed ~= "" then
+        table.insert(srt_files, trimmed)
+      end
+    end
+    pipe:close()
+  end
+
+  vlc.msg.dbg("[SubSource] Found " .. #srt_files .. " subtitle file(s) in ZIP")
+  if #srt_files == 0 then
+    setMessage(error_tag("ZIP contained no subtitle files"))
+    return false
+  end
+
+  -- Score each file against the requested season/episode
+  local season_num = 0
+  if input_table and input_table["seasonNumber"] then
+    season_num = tonumber(input_table["seasonNumber"]:get_text()) or 0
+  else
+    season_num = tonumber(openSub.movie.seasonNumber) or tonumber(openSub.movie.season) or 0
+  end
+
+  local episode_num = 0
+  if input_table and input_table["episodeNumber"] then
+    episode_num = tonumber(input_table["episodeNumber"]:get_text()) or 0
+  else
+    episode_num = tonumber(openSub.movie.episodeNumber) or tonumber(openSub.movie.episode) or 0
+  end
+
+  local best_file = srt_files[1]
+  local best_score = -999
+  for _, fpath in ipairs(srt_files) do
+    local fname = fpath:match("[^\\/]+$") or fpath
+    local sc = score_srt_for_episode(fname, season_num, episode_num)
+    vlc.msg.dbg("[SubSource] SRT candidate: " .. fname .. " score=" .. tostring(sc))
+    if sc > best_score then
+      best_score = sc
+      best_file = fpath
+    end
+  end
+
+  vlc.msg.dbg("[SubSource] Selected SRT: " .. best_file .. " (score=" .. tostring(best_score) .. ")")
+
+  local sf = io.open(best_file, "rb")
+  if not sf then
+    setMessage(error_tag("Cannot read extracted SRT: " .. best_file))
+    return false
+  end
+  local srt_content = sf:read("*a")
+  sf:close()
+
+  -- Patch item filename to match selected SRT
+  local selected_name = best_file:match("[^\\/]+$") or item.SubFileName
+  item.SubFileName = selected_name
+  item.SubFormat = selected_name:match("%.([^.]+)$") or "srt"
+
+  local success = openSub.saveAndLoadSubtitle(srt_content, item)
+  if success then
+    setMessage(success_tag("Subtitle downloaded from SubSource! (" .. #srt_files .. " file(s) in ZIP, best match selected)"))
+  end
+  save_config()
+  return success
+end
+
+-- Direct manual SubSource search handler
+function searchSubSourceDirect()
+  openSub.lastSearchMethod = "subsource"
+
+  local key = trim(openSub.option.subsource_api_key or "")
+  if key == "" then
+    setMessage(error_tag("Please enter your SubSource API Key in Configuration first."))
+    return
+  end
+
+  local sn_text = trim(input_table["seasonNumber"]:get_text())
+  if sn_text ~= "" and not tonumber(sn_text) then
+    setMessage(error_tag("Season must be a number"))
+    return
+  end
+  local ep_text = trim(input_table["episodeNumber"]:get_text())
+  if ep_text ~= "" and not tonumber(ep_text) then
+    setMessage(error_tag("Episode must be a number"))
+    return
+  end
+
+  openSub.movie.title = trim(input_table["title"]:get_text())
+  openSub.movie.year = trim(input_table["year"]:get_text())
+  openSub.movie.seasonNumber = tonumber(sn_text)
+  openSub.movie.episodeNumber = tonumber(ep_text)
+  local imdbInput = trim(input_table["imdbId"]:get_text())
+  openSub.movie.imdbId = extractIMDBId(imdbInput)
+
+  if openSub.movie.title == "" and (not openSub.movie.imdbId or openSub.movie.imdbId == "") then
+    openSub.getFileInfo()
+    openSub.getMovieInfo()
+    if input_table["title"] and openSub.movie.title then
+      input_table["title"]:set_text(openSub.movie.title)
+    end
+  end
+
+  local langs = getSelectedLanguages()
+  setMessage(loading_tag("Searching SubSource..."))
+
+  local results = subSource.search(
+    openSub.movie.title,
+    langs,
+    openSub.movie.seasonNumber,
+    openSub.movie.episodeNumber,
+    openSub.movie.imdbId,
+    openSub.movie.year,
+    false
+  )
+
+  openSub.itemStore = results
+  display_subtitles()
+  save_config() -- Save limits to config after search completes
+
+  if #results > 0 then
+    setMessage(success_tag("SubSource search complete: " .. #results .. " result(s)" .. subSource.getLimitsString()))
+  else
+    if subSource.getLimitsString() ~= "" then
+      -- Do not overwrite the error message if auth failed.
+      if not (input_table['message'] and input_table['message']:get_text():find("Auth failed")) then
+        setMessage(error_tag("No results found on SubSource." .. subSource.getLimitsString()))
+      end
+    else
+      setMessage(error_tag("No results found on SubSource."))
+    end
+  end
+end
+
+function show_more_action()
+  local is_fresh = (subSource.paginationState == nil)
+  
+  if not is_fresh and not subSource.paginationState.has_more then
+    setMessage(error_tag("No additional SubSource results found."))
+    return
+  end
+
+  setMessage(loading_tag("Fetching more results..."))
+
+  local langs = getSelectedLanguages()
+
+  -- Fetch next page (or start fresh)
+  local results = subSource.search(
+    openSub.movie.title,
+    langs,
+    openSub.movie.seasonNumber,
+    openSub.movie.episodeNumber,
+    openSub.movie.imdbId,
+    openSub.movie.year,
+    false,
+    not is_fresh
+  )
+  
+  if results and #results > 0 then
+    if not openSub.itemStore or type(openSub.itemStore) ~= "table" then
+      openSub.itemStore = {}
+    end
+    for _, item in ipairs(results) do
+      table.insert(openSub.itemStore, item)
+    end
+    
+    display_subtitles()
+
+    if subSource.paginationState and not subSource.paginationState.has_more then
+      setMessage(success_tag("Appended " .. #results .. " results (All SubSource pages loaded!)"))
+    else
+      setMessage(success_tag("Appended " .. #results .. " results."))
+    end
+  else
+    setMessage(error_tag("No additional SubSource results found."))
+  end
+
+  -- Save limits
+  save_config()
+end
+
+-- ==============================================================================
+-- AI Transcription Logic
+-- ==============================================================================
+local ai_dlg = nil
+local ai_is_running = false
+local ai_osd_ch_status = nil
+local ai_osd_ch_hint = nil
+local ai_osd_ch_subs = nil
+
+-- Utility to check if file exists
+local function ai_file_exists(name)
+  local f = io.open(name, "r")
+  if f ~= nil then io.close(f) return true else return false end
+end
+
+-- Parse SRT file into Lua table
+local function ai_parse_srt(filepath)
+  local f = io.open(filepath, "r")
+  if not f then return nil end
+  
+  local subs = {}
+  local state = 0
+  local current_sub = {}
+  for raw_line in f:lines() do
+      local line = string.gsub(raw_line, "\r", "")
+      
+      -- Format 1: Whisper stdout [00:00:00.000 --> 00:00:00.000] Text
+      local w_ts, w_te, w_text = string.match(line, "^%[(%d%d:%d%d:%d%d%.%d%d%d) %-%-%> (%d%d:%d%d:%d%d%.%d%d%d)%]%s*(.*)")
+      if w_ts and w_te then
+          local function parse_time(t)
+              local h,m,s,ms = string.match(t, "(%d%d):(%d%d):(%d%d)[%,%.](%d%d%d)")
+              return tonumber(h)*3600 + tonumber(m)*60 + tonumber(s) + tonumber(ms)/1000
+          end
+          table.insert(subs, {
+              start_s = parse_time(w_ts),
+              end_s = parse_time(w_te),
+              text = w_text
+          })
+      else
+          -- Format 2: Standard SRT State Machine
+          if state == 0 and string.match(line, "^%d+$") then
+              state = 1
+              current_sub = {text=""}
+          elseif state == 1 then
+              local ts, te = string.match(line, "(%d%d:%d%d:%d%d,%d%d%d) %-%-%> (%d%d:%d%d:%d%d,%d%d%d)")
+              if ts and te then
+                  local function parse_time(t)
+                      local h,m,s,ms = string.match(t, "(%d%d):(%d%d):(%d%d),(%d%d%d)")
+                      return tonumber(h)*3600 + tonumber(m)*60 + tonumber(s) + tonumber(ms)/1000
+                  end
+                  current_sub.start_s = parse_time(ts)
+                  current_sub.end_s = parse_time(te)
+                  state = 2
+              else
+                  state = 0 -- invalid
+              end
+          elseif state == 2 then
+              if line == "" then
+                  table.insert(subs, current_sub)
+                  state = 0
+              else
+                  current_sub.text = current_sub.text == "" and line or (current_sub.text .. "\n" .. line)
+              end
+          end
+      end
+  end
+  if state == 2 and current_sub.text ~= "" then
+      table.insert(subs, current_sub)
+  end
+  f:close()
+  return subs
+end
+
+function ai_abort_transcription()
+  if not ai_is_running then return end
+  local slash = package.config:sub(1,1)
+  local ai_dir = openSub.conf.dirPath .. slash .. "vlsub_ai"
+  local abort_flag = ai_dir .. slash .. "abort_flag.txt"
+  local pid_file = ai_dir .. slash .. "pid.txt"
+  
+  local pid_f = io.open(pid_file, "r")
+  if pid_f then
+      local pid = pid_f:read("*l")
+      pid_f:close()
+      if pid and pid ~= "" then
+          os.execute('taskkill /F /PID ' .. pid .. ' /T >nul 2>&1')
+      end
+  end
+  local af = io.open(abort_flag, "w")
+  if af then af:write("ABORT"); af:close() end
+  ai_is_running = false
+  if input_table and input_table['ai_start'] then
+      input_table['ai_start']:set_text("🎙️ Transcribe")
+  end
+  vlc.msg.dbg("[VLSub] AI Transcription forcefully aborted via cleanup routine.")
+end
+
+function ai_start_transcription(status_label)
+  if ai_is_running then return end
+  ai_is_running = true
+
+  if input_table and input_table['ai_start'] then
+      input_table['ai_start']:set_text("⏹ Abort")
+  end
+
+  -- Always register OSD channels to avoid invalid channel crashes on video switch
+  ai_osd_ch_status = vlc.osd.channel_register()
+  ai_osd_ch_hint = vlc.osd.channel_register()
+  ai_osd_ch_subs = vlc.osd.channel_register()
+
+  local model_name = openSub.option.ai_model or "tiny"
+  local ai_language = openSub.option.ai_language or "auto"
+  local lang_arg = ""
+  if string.lower(ai_language) ~= "auto" then
+      local iso_code = string.sub(string.lower(ai_language), 1, 2)
+      lang_arg = " -l " .. iso_code
+  end
+  
+  -- Store everything in a dedicated vlsub_ai subfolder
+  local ai_dir = openSub.conf.dirPath .. slash .. "vlsub_ai"
+
+  local whisper_zip = ai_dir .. slash .. "whisper-bin-x64.zip"
+  local whisper_exe = ai_dir .. slash .. "main.exe"
+  local model_bin = ai_dir .. slash .. "ggml-" .. model_name .. ".bin"
+  local audio_wav = ai_dir .. slash .. "temp_audio.wav"
+  local srt_out = ai_dir .. slash .. "temp_audio.wav.srt"
+  local done_flag = ai_dir .. slash .. "whisper_done.txt"
+  local status_file = ai_dir .. slash .. "ai_status.txt"
+  local ps1_file = ai_dir .. slash .. "ai_runner.ps1"
+  local abort_flag = ai_dir .. slash .. "abort_flag.txt"
+  local pid_file = ai_dir .. slash .. "pid.txt"
+  local seek_hint = ai_dir .. slash .. "seek_hint.txt"
+  local chunks_done = ai_dir .. slash .. "chunks_done.txt"
+  local chunk_ready = ai_dir .. slash .. "chunk_ready.txt"
+  local chunks_dir = ai_dir .. slash .. "chunks"
+
+  -- Ensure directory exists before Lua tries to write the ps1 file
+  if not is_dir(ai_dir) then
+      local success = os.execute('powershell -WindowStyle Hidden -Command "New-Item -ItemType Directory -Force -Path \'' .. escape_powershell(ai_dir) .. '\'"')
+  end
+
+  -- Kill any orphaned background processes from a previous crash
+  local pid_f = io.open(pid_file, "r")
+  if pid_f then
+      local pid = pid_f:read("*l")
+      pid_f:close()
+      if pid and pid ~= "" then
+          os.execute('taskkill /F /PID ' .. pid .. ' /T >nul 2>&1')
+      end
+  end
+
+  local item = vlc.input.item()
+  if not item then
+    status_label:set_text("Status: Error - No video loaded.")
+    ai_is_running = false
+    return
+  end
+  local video_uri = item:uri()
+  -- Network streams and local files are both supported via chunked ffmpeg extraction
+  
+  -- Hint to user on how to safely abort
+  vlc.osd.message("AI Transcription initiated. To abort, press Stop (■).", ai_osd_ch_hint, "bottom", 6000000)
+
+  -- Write the background PowerShell script
+  local f = io.open(ps1_file, "w")
+  if not f then
+      status_label:set_text("Status: Error writing script.")
+      ai_is_running = false
+      return
+  end
+
+  local ps_script = string.format([[
+$ErrorActionPreference = "SilentlyContinue"
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+$PID | Out-File -FilePath "%s" -Encoding ascii
+
+$ai_dir = "%s"
+$whisper_exe = "%s"
+$model_bin = "%s"
+$srt_out = "%s"
+$done_flag = "%s"
+$status_file = "%s"
+$video_uri = "%s"
+$abort_flag = "%s"
+$seek_hint = "%s"
+$chunks_done_file = "%s"
+$chunk_ready = "%s"
+$chunks_dir = "%s"
+$ffmpeg_exe = "$ai_dir\ffmpeg.exe"
+$ffprobe_exe = "$ai_dir\ffprobe.exe"
+$chunk_seconds = 30
+
+if (Test-Path $abort_flag) { Remove-Item $abort_flag }
+if (Test-Path $done_flag) { Remove-Item $done_flag }
+if (Test-Path $chunk_ready) { Remove-Item $chunk_ready }
+if (Test-Path $chunks_done_file) { Remove-Item $chunks_done_file }
+if (Test-Path "$srt_out.live") { Remove-Item "$srt_out.live" }
+New-Item -ItemType Directory -Force -Path $chunks_dir | Out-Null
+
+Function Check-Abort {
+    if ((Get-Process -Name vlc -ErrorAction SilentlyContinue) -eq $null) { return $true }
+    if (Test-Path $abort_flag) { return $true }
+    return $false
+}
+
+Set-Content -Path $status_file -Value "Checking dependencies..."
+
+Function Download-FileWithProgress {
+    param($url, $destination, $label)
+    $tmpDest = "$destination.tmp"
+    $wc = New-Object System.Net.WebClient
+    try {
+        $stream = $wc.OpenRead($url)
+        $totalSize = [int]$wc.ResponseHeaders["Content-Length"]
+        $fileStream = [System.IO.File]::Create($tmpDest)
+        $buffer = New-Object byte[] 65536
+        $read = 0
+        $downloaded = 0
+        $lastPercent = -1
+        $dlChunks = 0
+        while (($read = $stream.Read($buffer, 0, $buffer.Length)) -gt 0) {
+            $fileStream.Write($buffer, 0, $read)
+            $downloaded += $read
+            $dlChunks++
+            
+            if ($totalSize -gt 0) {
+                $percent = [math]::Round(($downloaded / $totalSize) * 100)
+                if ($percent -ne $lastPercent) {
+                    Set-Content -Path $status_file -Value "$label $percent%%"
+                    $lastPercent = $percent
+                }
+            }
+            
+            if ($dlChunks %% 50 -eq 0) {
+                if (Check-Abort) {
+                    $fileStream.Close()
+                    $stream.Close()
+                    Remove-Item $tmpDest -Force -ErrorAction SilentlyContinue
+                    exit
+                }
+            }
+        }
+        $fileStream.Close()
+        $stream.Close()
+        if (Test-Path $destination) { Remove-Item $destination -Force }
+        Rename-Item -Path $tmpDest -NewName (Split-Path $destination -Leaf) -Force
+    } catch {
+        Set-Content -Path $status_file -Value "Error downloading $label"
+        exit
+    }
+}
+
+# --- Dependency: Whisper ---
+if (-not (Test-Path $whisper_exe)) {
+    Download-FileWithProgress -url "https://github.com/ggerganov/whisper.cpp/releases/download/v1.5.4/whisper-bin-x64.zip" -destination "$ai_dir\whisper-bin-x64.zip" -label "Downloading Whisper..."
+    Set-Content -Path $status_file -Value "Extracting Whisper..."
+    Expand-Archive -Force -Path "$ai_dir\whisper-bin-x64.zip" -DestinationPath $ai_dir
+}
+
+if (-not (Test-Path $model_bin)) {
+    Download-FileWithProgress -url "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-%s.bin" -destination $model_bin -label "Downloading Model..."
+}
+
+# --- Dependency: ffmpeg ---
+if (-not (Test-Path $ffmpeg_exe)) {
+    $sys_ffmpeg = (Get-Command ffmpeg -ErrorAction SilentlyContinue).Source
+    if ($sys_ffmpeg) {
+        $ffmpeg_exe = $sys_ffmpeg
+        $sys_ffprobe = (Get-Command ffprobe -ErrorAction SilentlyContinue).Source
+        if ($sys_ffprobe) { $ffprobe_exe = $sys_ffprobe }
+    } else {
+        Download-FileWithProgress -url "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip" -destination "$ai_dir\ffmpeg.zip" -label "Downloading ffmpeg..."
+        Set-Content -Path $status_file -Value "Extracting ffmpeg..."
+        Expand-Archive -Force -Path "$ai_dir\ffmpeg.zip" -DestinationPath "$ai_dir\ffmpeg_temp"
+        $bin_found = Get-ChildItem "$ai_dir\ffmpeg_temp" -Recurse -Filter "ffmpeg.exe" | Select-Object -First 1
+        if ($bin_found) {
+            Copy-Item $bin_found.FullName $ffmpeg_exe
+            $probe_found = Join-Path $bin_found.DirectoryName "ffprobe.exe"
+            if (Test-Path $probe_found) { Copy-Item $probe_found $ffprobe_exe }
+        }
+        Remove-Item "$ai_dir\ffmpeg_temp" -Recurse -Force -ErrorAction SilentlyContinue
+        Remove-Item "$ai_dir\ffmpeg.zip" -Force -ErrorAction SilentlyContinue
+    }
+}
+
+if (-not (Test-Path $ffmpeg_exe)) {
+    Set-Content -Path $status_file -Value "Error: ffmpeg not found and download failed."
+    exit
+}
+
+# --- Resolve URI to local path if it is a local file ---
+$resolved_uri = $video_uri
+if ($video_uri -like "file://*") {
+    try {
+        $resolved_uri = ([System.Uri]$video_uri).LocalPath
+    } catch {
+        $resolved_uri = $video_uri -replace '^file:///', '' -replace '^file://', '' -replace '/', '\'
+    }
+}
+
+# --- YouTube URL resolution via yt-dlp (best-effort) ---
+if ($resolved_uri -match "youtube\.com|youtu\.be") {
+    $ytdlp = (Get-Command yt-dlp -ErrorAction SilentlyContinue).Source
+    if ($ytdlp) {
+        Set-Content -Path $status_file -Value "Resolving YouTube URL..."
+        $yt_resolved = & $ytdlp --get-url -f "bestaudio" $resolved_uri 2>$null
+        if ($yt_resolved) { $resolved_uri = $yt_resolved }
+    }
+}
+
+# --- Detect finite vs. live stream via ffprobe ---
+$is_live = $true
+$total_chunks = [int]::MaxValue
+if (Test-Path $ffprobe_exe) {
+    $dur_str = & $ffprobe_exe -v error -show_entries format=duration -of csv=p=0 $resolved_uri 2>$null
+    $duration = 0
+    if ([double]::TryParse($dur_str, [ref]$duration) -and $duration -gt 0) {
+        $is_live = $false
+        $total_chunks = [math]::Ceiling($duration / $chunk_seconds)
+    }
+}
+
+# --- Main chunked transcription loop ---
+$completed = @{}
+$sequential_index = 0
+
+Set-Content -Path $status_file -Value "Transcribing..."
+
+while ($true) {
+    if (Check-Abort) { exit }
+    
+    # Determine target chunk
+    $target_chunk = -1
+    if ($is_live) {
+        $target_chunk = $sequential_index
+    } else {
+        # Read seek hint from Lua
+        $hint = 0
+        $hint_str = Get-Content $seek_hint -ErrorAction SilentlyContinue
+        if ($hint_str) { [double]::TryParse($hint_str, [ref]$hint) | Out-Null }
+        $current_chunk = [math]::Floor($hint / $chunk_seconds)
+        
+        # Find first uncompleted chunk from current position forward (up to 2 ahead)
+        for ($i = $current_chunk; $i -le ($current_chunk + 2) -and $i -lt $total_chunks; $i++) {
+            if ($i -ge 0 -and -not $completed.ContainsKey($i)) {
+                $target_chunk = $i
+                break
+            }
+        }
+    }
+    
+    # All nearby chunks done — check if fully done (finite) or idle-wait
+    if ($target_chunk -eq -1) {
+        # Signal chunk ready so Lua can resume if paused (seek-back to completed region)
+        Set-Content -Path $chunk_ready -Value "done"
+        if (-not $is_live -and $completed.Count -ge $total_chunks) {
+            Set-Content -Path $status_file -Value "Done!"
+            Set-Content -Path $done_flag -Value "DONE"
+            break
+        }
+        Start-Sleep -Seconds 1
+        continue
+    }
+    
+    # Skip if already completed
+    if ($completed.ContainsKey($target_chunk)) {
+        if ($is_live) { Start-Sleep -Seconds 1 }
+        continue
+    }
+    
+    # Extract chunk audio via ffmpeg
+    $offset = $target_chunk * $chunk_seconds
+    $chunk_name = "chunk_" + $target_chunk.ToString("D5")
+    $chunk_wav = "$chunks_dir\$chunk_name.wav"
+    
+    if ($is_live) {
+        # Live: no seeking, just record the next N seconds
+        $ffArgs = @("-y", "-i", $resolved_uri, "-t", $chunk_seconds, "-ac", "1", "-ar", "16000", $chunk_wav)
+    } else {
+        # Finite: seek to offset and extract chunk
+        $ffArgs = @("-y", "-ss", $offset, "-t", $chunk_seconds, "-i", $resolved_uri, "-ac", "1", "-ar", "16000", $chunk_wav)
+    }
+    
+    & $ffmpeg_exe @ffArgs *>$null
+    
+    if (Check-Abort) { exit }
+    if (-not (Test-Path $chunk_wav)) {
+        Start-Sleep -Seconds 2
+        continue
+    }
+    
+    # Transcribe chunk via whisper (no -ot; we shift timestamps in post-processing)
+    $wArgs = @("-m", $model_bin, "-f", $chunk_wav, "-osrt")
+    $lang_str = "%s".Trim()
+    if ($lang_str -ne "") {
+        $wArgs += $lang_str.Split(" ", [System.StringSplitOptions]::RemoveEmptyEntries)
+    }
+    & $whisper_exe @wArgs *>$null
+    
+    if (Check-Abort) { exit }
+    
+    # whisper outputs to chunk_NNNNN.wav.srt with timestamps starting at 0
+    # Shift all timestamps by $offset seconds to align with video timeline
+    $chunk_srt = "$chunk_wav.srt"
+    if (Test-Path $chunk_srt) {
+        $srtLines = Get-Content $chunk_srt
+        $shifted = @()
+        foreach ($srtLine in $srtLines) {
+            if ($srtLine -match '^(\d{2}):(\d{2}):(\d{2}),(\d{3}) --> (\d{2}):(\d{2}):(\d{2}),(\d{3})$') {
+                $st = [int]$Matches[1]*3600 + [int]$Matches[2]*60 + [int]$Matches[3] + [int]$Matches[4]/1000 + $offset
+                $et = [int]$Matches[5]*3600 + [int]$Matches[6]*60 + [int]$Matches[7] + [int]$Matches[8]/1000 + $offset
+                $fmtTime = { param($t) $h=[int][math]::Floor($t/3600); $m=[int][math]::Floor(($t%%3600)/60); $s=[int][math]::Floor($t%%60); $ms=[int][math]::Floor(($t%%1)*1000); "{0:D2}:{1:D2}:{2:D2},{3:D3}" -f $h,$m,$s,$ms }
+                $shifted += "$(& $fmtTime $st) --> $(& $fmtTime $et)"
+            } else {
+                $shifted += $srtLine
+            }
+        }
+        $shifted | Add-Content "$srt_out.live"
+    }
+    
+    # Signal chunk ready (Lua will detect this and resume VLC if paused)
+    Set-Content -Path $chunk_ready -Value $target_chunk
+    
+    # Track completion and cleanup chunk files
+    $completed[$target_chunk] = $true
+    Add-Content -Path $chunks_done_file -Value $target_chunk
+    Remove-Item $chunk_wav -Force -ErrorAction SilentlyContinue
+    Remove-Item $chunk_srt -Force -ErrorAction SilentlyContinue
+    
+    if ($is_live) { $sequential_index++ }
+    
+    Set-Content -Path $status_file -Value "Transcribing... ($($completed.Count) chunks done)"
+}
+]], pid_file, ai_dir, whisper_exe, model_bin, srt_out, done_flag, status_file, video_uri, abort_flag, seek_hint, chunks_done, chunk_ready, chunks_dir, model_name, lang_arg)
+
+  f:write(ps_script)
+  f:close()
+
+  -- Run powershell asynchronously with BelowNormal priority to prevent VLC UI starvation
+  os.execute(string.format('start /b /belownormal powershell -ExecutionPolicy Bypass -WindowStyle Hidden -File "%s"', escape_cmd_win(ps1_file)))
+
+  local init_input = vlc.object.input()
+  local should_play_after_chunk = (vlc.playlist.status() == "playing")
+
+  -- Pause VLC until first chunk is transcribed
+  if should_play_after_chunk then
+      vlc.playlist.pause()
+  end
+  vlc.osd.message("AI: Preparing subtitles...", ai_osd_ch_status, "center", 10000000)
+
+  -- Write initial seek hint so PowerShell knows where to start
+  local init_time = vlc.var.get(init_input, "time")
+  local sh = io.open(seek_hint, "w")
+  if sh then
+      sh:write(tostring((init_time or 0) / 1000000))
+      sh:close()
+  end
+
+  -- OSD Polling Loop
+  local last_status = ""
+  local last_known_time = (init_time or 0) / 1000000
+  local is_paused_for_chunk = true  -- Start paused, waiting for first chunk
+  local cached_chunks_done = {}     -- Cache completed chunk indices
+  local cached_subs = {}            -- Cache parsed SRT entries
+  local last_live_size = 0          -- Track .live file size for cache invalidation
+  local last_chunks_done_size = 0   -- Track chunks_done file size for cache invalidation
+  while ai_is_running do
+      -- Check done flag
+      if ai_file_exists(done_flag) then break end
+
+      -- 1. CLEAN SLEEP (Prevents Main VLC Player from lagging / CPU Starvation)
+      if vlc.mwait and vlc.mdate then
+          vlc.mwait(vlc.mdate() + 500000) -- Clean 500ms sleep at OS level (VLC 3+)
+      elseif vlc.misc and vlc.misc.mwait and vlc.misc.mdate then
+          vlc.misc.mwait(vlc.misc.mdate() + 500000) -- Clean 500ms sleep at OS level (VLC 2.x)
+      else
+          -- Fallback: use a dummy network poll to sleep safely without flashing a window or burning CPU
+          local dummy_fds = nil
+          if vlc.net and vlc.net.listen_tcp then dummy_fds = vlc.net.listen_tcp("127.0.0.1", 0) end
+          if dummy_fds and dummy_fds[1] and vlc.net.poll then
+              vlc.net.poll({[dummy_fds[1]] = vlc.net.POLLIN}, 500)
+              pcall(vlc.net.close, dummy_fds[1])
+          else
+              local delay_start = os.clock()
+              while (os.clock() - delay_start) < 0.5 do end
+          end
+      end
+      
+      if not ai_is_running then break end
+      if vlc.keep_alive then vlc.keep_alive() end
+      if dlg and dlg.update then dlg:update() end
+      
+      -- 2. CHECK PLAYLIST STATUS FIRST (Prevents the crash on "Stop")
+      -- If you touch vlc.object.input() during teardown, VLC will immediately segfault.
+      local status = vlc.playlist.status()
+      if status == "stopped" or status == "unknown" then
+          ai_abort_transcription()
+          break
+      end
+      
+      -- 3. NOW IT IS SAFE TO FETCH INPUT AND ITEM
+      local current_input = vlc.object.input()
+      local current_item = vlc.input.item()
+      
+      if not current_input or not current_item then
+          ai_abort_transcription()
+          break
+      end
+      
+      -- Video switch detection
+      local current_uri = current_item:uri()
+      if current_uri ~= video_uri then
+          ai_abort_transcription()
+          break
+      end
+      
+      -- Update status label from file and push to OSD
+      local sf = io.open(status_file, "r")
+      if sf then
+          local s_text = sf:read("*line")
+          sf:close()
+          if s_text and s_text ~= last_status then
+              vlc.osd.message("AI: " .. s_text, ai_osd_ch_status, "top-right", 3000000)
+              last_status = s_text
+          end
+          if s_text and input_table and input_table['ai_status'] then
+              input_table['ai_status']:set_text(s_text)
+          end
+          if string.match(s_text or "", "^Error") then
+              ai_is_running = false
+              break
+          end
+      end
+      
+      -- Fetch the time using the validated input
+      local current_time = vlc.var.get(current_input, "time")
+      if current_time then
+          current_time = current_time / 1000000
+          
+          -- Write seek hint for PowerShell chunk prioritization
+          local sh_w = io.open(seek_hint, "w")
+          if sh_w then sh_w:write(tostring(current_time)); sh_w:close() end
+          
+          -- Detect seek: time jumped more than 5 seconds from expected
+          if not is_paused_for_chunk and math.abs(current_time - last_known_time) > 5 then
+              -- User seeked! Pause and wait for chunk at new position
+              should_play_after_chunk = (vlc.playlist.status() == "playing")
+              if should_play_after_chunk then
+                  vlc.playlist.pause()
+              end
+              is_paused_for_chunk = true
+              vlc.osd.message("AI: Loading subtitles...", ai_osd_ch_status, "center", 10000000)
+              -- Remove old chunk_ready signal so we wait for a fresh one
+              os.remove(chunk_ready)
+          end
+          
+          -- Buffer underrun: check if current chunk has been transcribed
+          if not is_paused_for_chunk then
+              local current_chunk_idx = math.floor(current_time / 30)
+              -- Refresh chunks_done cache only when file changes
+              local cd_size = 0
+              local cd_check = io.open(chunks_done, "r")
+              if cd_check then
+                  cd_check:seek("end")
+                  cd_size = cd_check:seek()
+                  cd_check:close()
+              end
+              if cd_size ~= last_chunks_done_size then
+                  last_chunks_done_size = cd_size
+                  cached_chunks_done = {}
+                  local cd = io.open(chunks_done, "r")
+                  if cd then
+                      for cline in cd:lines() do
+                          local idx = tonumber(cline)
+                          if idx then cached_chunks_done[idx] = true end
+                      end
+                      cd:close()
+                  end
+              end
+              if not cached_chunks_done[current_chunk_idx] then
+                  -- Playback entered untranscribed territory, pause until ready
+                  should_play_after_chunk = (vlc.playlist.status() == "playing")
+                  if should_play_after_chunk then
+                      vlc.playlist.pause()
+                  end
+                  is_paused_for_chunk = true
+                  vlc.osd.message("AI: Buffering subtitles...", ai_osd_ch_status, "center", 10000000)
+                  os.remove(chunk_ready)
+              end
+          end
+          
+          -- If paused waiting for chunk, check if it's ready
+          if is_paused_for_chunk then
+              if ai_file_exists(chunk_ready) then
+                  -- Chunk at current position is transcribed, resume!
+                  os.remove(chunk_ready)
+                  if should_play_after_chunk then
+                      vlc.playlist.play()
+                  end
+                  is_paused_for_chunk = false
+                  vlc.osd.message("", ai_osd_ch_status, "center", 1)  -- clear status
+              end
+          end
+          
+          -- Update expected time for next iteration (current + poll interval)
+          last_known_time = current_time + 0.5
+          
+          -- OSD subtitle display (with file-size cache)
+          local live_file = srt_out .. ".live"
+          local lf_size = 0
+          local lf_check = io.open(live_file, "r")
+          if lf_check then
+              lf_check:seek("end")
+              lf_size = lf_check:seek()
+              lf_check:close()
+          end
+          if lf_size ~= last_live_size then
+              last_live_size = lf_size
+              cached_subs = ai_parse_srt(live_file) or {}
+          end
+          
+          local found_text = nil
+          for _, sub in ipairs(cached_subs) do
+              if current_time >= sub.start_s and current_time <= sub.end_s then
+                  found_text = sub.text
+                  break
+              end
+          end
+          
+          if found_text then
+              vlc.osd.message(found_text, ai_osd_ch_subs, "bottom", 1000000)
+          end
+      end
+  end
+
+  ai_is_running = false
+  if input_table and input_table['ai_start'] then
+      input_table['ai_start']:set_text("🎙️ Transcribe")
+  end
+
+  -- Signal completion (no SRT file produced — OSD-only transcription)
+  if vlc.input.item() then
+      vlc.osd.message("AI Transcription Complete!", ai_osd_ch_status, "top-right", 4000000)
+  end
+  if input_table and input_table['ai_status'] then
+      input_table['ai_status']:set_text("Completed!")
+  end
+  
+  -- Cleanup temp files
+  os.remove(done_flag)
+  os.remove(ps1_file)
+  os.remove(srt_out .. ".live")
+  os.remove(seek_hint)
+  os.remove(chunks_done)
+  os.remove(chunk_ready)
+  os.execute('powershell -WindowStyle Hidden -Command "Remove-Item -Recurse -Force \'' .. escape_powershell(chunks_dir) .. '\' -ErrorAction SilentlyContinue"')
+end
+
+function ai_start_transcription_proxy()
+  if ai_is_running then
+    ai_abort_transcription()
+    return
+  end
+
+  if not input_table or not input_table['ai_status'] then return end
+
+  if input_table['ai_language_main'] then
+    local sel_val = input_table['ai_language_main']:get_value()
+    local sel_cf = select_conf['ai_language_main']
+    if sel_val > 0 and sel_cf and sel_cf.cf[sel_val] then
+      openSub.option.ai_language = sel_cf.cf[sel_val][1]
+      save_config()
+    end
+  end
+
+  ai_start_transcription(input_table['ai_status'])
+end
+
+function get_filtered_ai_languages(ignore_model_filter)
+  local whisper_langs = {en=true, zh=true, de=true, es=true, ru=true, ko=true, fr=true, ja=true, pt=true, tr=true, pl=true, ca=true, nl=true, ar=true, sv=true, it=true, id=true, hi=true, fi=true, vi=true, he=true, uk=true, el=true, ms=true, cs=true, ro=true, da=true, hu=true, ta=true, no=true, th=true, ur=true, hr=true, bg=true, lt=true, la=true, mi=true, ml=true, cy=true, sk=true, te=true, fa=true, lv=true, bn=true, sr=true, az=true, sl=true, kn=true, et=true, mk=true, br=true, eu=true, is=true, hy=true, ne=true, mn=true, bs=true, kk=true, sq=true, sw=true, gl=true, mr=true, pa=true, si=true, km=true, sn=true, yo=true, so=true, af=true, oc=true, ka=true, be=true, tg=true, sd=true, gu=true, am=true, yi=true, lo=true, uz=true, fo=true, ht=true, ps=true, tk=true, nn=true, mt=true, sa=true, lb=true, my=true, bo=true, tl=true, mg=true, as=true, tt=true, haw=true, ln=true, ha=true, ba=true, jv=true, su=true}
+  local ai_model = openSub.option.ai_model or "tiny"
+  local is_en_only = (not ignore_model_filter) and (string.match(ai_model, "%.en$") ~= nil)
+  
+  local filtered = {}
+  if openSub.conf.languages then
+    for _, l in ipairs(openSub.conf.languages) do
+      local code = l[1]
+      local base_code = string.sub(string.lower(code), 1, 2)
+      
+      if is_en_only then
+        if base_code == "en" then
+          table.insert(filtered, l)
+        end
+      elseif whisper_langs[base_code] then
+        table.insert(filtered, l)
+      end
+    end
+  end
+  return filtered
+end
 
 -- Modified interface_main function - update the help button to pass window context
 function interface_main()
@@ -1748,7 +3269,7 @@ function interface_main()
   input_table['episodeNumber'] = dlg:add_text_input(
     openSub.movie.episodeNumber or "", 4, 2, 1, 1)
 
-  -- Row 3: Year, IMDB ID
+  -- Row 3: Year, IMDB ID, and Search (SubSource) button
   dlg:add_label("Year:", 1, 3, 1, 1)
   input_table['year'] = dlg:add_text_input(
     openSub.movie.year or "", 2, 3, 1, 1)
@@ -1757,18 +3278,26 @@ function interface_main()
     openSub.movie.imdbId or "", 4, 3, 1, 1)
   dlg:add_button("🔍 "..lang["int_search_name"],
     searchIMBD_v2, 6, 2, 1, 1)
+  dlg:add_button("🔍 "..(lang["int_search_subsource"] or "Search (SubSource)"),
+    searchSubSourceDirect, 6, 3, 1, 1)
+
+  -- AI Transcription UI
+  dlg:add_label("AI Language:", 5, 4, 1, 1)
+  input_table['ai_language_main'] = dlg:add_dropdown(6, 4, 1, 1)
+  input_table['ai_start'] = dlg:add_button("🎙️ Transcribe", ai_start_transcription_proxy, 6, 5, 1, 1)
+  input_table['ai_status'] = dlg:add_label("Ready", 6, 6, 1, 1)
 
   -- Row 4: Language selection
   dlg:add_label(lang["int_default_lang"]..":", 1, 4, 1, 1)
-  input_table['language'] =  dlg:add_dropdown(2, 4, 4, 1)
+  input_table['language'] =  dlg:add_dropdown(2, 4, 3, 1)
 
   -- Row 5: Secondary language
   dlg:add_label(lang["int_second_lang"]..":", 1, 5, 1, 1)
-  input_table['language2'] =  dlg:add_dropdown(2, 5, 4, 1)
+  input_table['language2'] =  dlg:add_dropdown(2, 5, 3, 1)
 
   -- Row 6: Third language
   dlg:add_label(lang["int_third_lang"]..":", 1, 6, 1, 1)
-  input_table['language3'] = dlg:add_dropdown(2, 6, 4, 1)
+  input_table['language3'] = dlg:add_dropdown(2, 6, 3, 1)
 
   -- Row 7: Sorting controls
   dlg:add_label("Sort by:", 1, 7, 1, 1)
@@ -1792,6 +3321,9 @@ function interface_main()
   dlg:add_button(
     "🔗 Link", open_subtitle_link, 2, 11, 1, 1)
 
+  input_table['show_more'] = dlg:add_button(
+    "➕ Show More (SubSource)", show_more_action, 3, 11, 2, 1)
+
   dlg:add_button(
     "⚙️ Config", show_conf, 5, 11, 1, 1)
   dlg:add_button(
@@ -1803,6 +3335,7 @@ function interface_main()
   assoc_select_conf('language', 'language', openSub.conf.languages, 2, lang["int_all"])
   assoc_select_conf('language2', 'language2', openSub.conf.languages, 2, 'None')
   assoc_select_conf('language3', 'language3', openSub.conf.languages, 2, 'None')
+  assoc_select_conf('ai_language_main', 'ai_language', get_filtered_ai_languages(), 2, 'Auto')
   assoc_select_conf('sort_by', 'sortBy', openSub.conf.sortByOptions, 2, 'Default')
   assoc_select_conf('sort_direction', 'sortDirection', openSub.conf.sortDirectionOptions, 2)
 
@@ -1825,73 +3358,95 @@ function interface_config()
     type(openSub.option.os_password) == "string"
     and openSub.option.os_password or "", 2, 2, 2, 1)
 
-  -- Row 3: Default primary language
-  dlg:add_label(lang["int_default_lang"]..":", 1, 3, 2, 1)
-  input_table['default_language'] = dlg:add_dropdown(3, 3, 1, 1)
+  -- Row 3: SubSource API Key (Optional)
+  dlg:add_label((lang["int_subsource_api_key"] or "SubSource API Key")..":", 1, 3, 1, 1)
+  input_table['subsource_api_key'] = dlg:add_text_input(
+    type(openSub.option.subsource_api_key) == "string"
+    and openSub.option.subsource_api_key or "", 2, 3, 2, 1)
+  
+  local info_text = (lang["int_subsource_api_key_info"] or "You can find your SubSource API Key ")
+    .. "<a href='https://subsource.net/dashboard/profile'>"
+    .. string.lower(lang["int_here"] or "here")
+    .. "</a>."
+  dlg:add_label(info_text, 4, 3, 1, 1)
 
-  -- Row 4: Default secondary language
-  dlg:add_label(lang["int_second_lang"]..":", 1, 4, 2, 1)
-  input_table['default_language2'] = dlg:add_dropdown(3, 4, 1, 1)
+  -- Row 4: Default primary language
+  dlg:add_label(lang["int_default_lang"]..":", 1, 4, 2, 1)
+  input_table['default_language'] = dlg:add_dropdown(3, 4, 1, 1)
 
-  -- Row 5: Default third language
-  dlg:add_label(lang["int_third_lang"]..":", 1, 5, 2, 1)
-  input_table['default_language3'] = dlg:add_dropdown(3, 5, 1, 1)
+  -- Row 5: Default secondary language
+  dlg:add_label(lang["int_second_lang"]..":", 1, 5, 2, 1)
+  input_table['default_language2'] = dlg:add_dropdown(3, 5, 1, 1)
 
-  -- Row 6: Download behavior
-  dlg:add_label(lang["int_dowload_behav"]..":", 1, 6, 2, 1)
-  input_table['downloadBehaviour'] = dlg:add_dropdown(3, 6, 1, 1)
+  -- Row 6: Default third language
+  dlg:add_label(lang["int_third_lang"]..":", 1, 6, 2, 1)
+  input_table['default_language3'] = dlg:add_dropdown(3, 6, 1, 1)
 
-  -- Row 7: Display language code
-  dlg:add_label(lang["int_display_code"]..":", 1, 7, 2, 1)
-  input_table['langExt'] = dlg:add_dropdown(3, 7, 1, 1)
+  -- Row 7: AI Model
+  dlg:add_label("AI Model:", 1, 7, 2, 1)
+  input_table['ai_model'] = dlg:add_dropdown(3, 7, 1, 1)
 
-  -- Row 8: Remove tags
-  dlg:add_label(lang["int_remove_tag"]..":", 1, 8, 2, 1)
-  input_table['removeTag'] = dlg:add_dropdown(3, 8, 1, 1)
+  -- Row 8: Download behavior
+  dlg:add_label(lang["int_dowload_behav"]..":", 1, 8, 2, 1)
+  input_table['downloadBehaviour'] = dlg:add_dropdown(3, 8, 1, 1)
 
-  -- REMOVED: Row 9: Use curl option (no longer needed)
+  -- Row 9: AI Transcription Language
+  dlg:add_label("AI Transcribe Language:", 1, 9, 2, 1)
+  input_table['ai_language_cfg'] = dlg:add_dropdown(3, 9, 1, 1)
 
-  -- Row 9: Working directory (moved up from row 10)
+  -- Row 10: Display language code
+  dlg:add_label(lang["int_display_code"]..":", 1, 10, 2, 1)
+  input_table['langExt'] = dlg:add_dropdown(3, 10, 1, 1)
+
+  -- Row 11: Remove tags
+  dlg:add_label(lang["int_remove_tag"]..":", 1, 11, 2, 1)
+  input_table['removeTag'] = dlg:add_dropdown(3, 11, 1, 1)
+
+  -- Row 12: Working directory
   if openSub.conf.dirPath then
     if openSub.conf.os == "lin" then
-      dlg:add_label(lang["int_vlsub_work_dir"], 1, 9, 2, 1)
+      dlg:add_label(lang["int_vlsub_work_dir"], 1, 12, 2, 1)
     elseif openSub.conf.os == "win" then
       dlg:add_label(
         "<a href='file:///"..openSub.conf.dirPath.."'>"..
-        lang["int_vlsub_work_dir"].."</a>", 1, 9, 2, 1)
+        lang["int_vlsub_work_dir"].."</a>", 1, 12, 2, 1)
     else
       dlg:add_label(
         "<a href='"..openSub.conf.dirPath.."'>"..
-        lang["int_vlsub_work_dir"].."</a>", 1, 9, 2, 1)
+        lang["int_vlsub_work_dir"].."</a>", 1, 12, 2, 1)
     end
   else
-    dlg:add_label(lang["int_vlsub_work_dir"], 1, 9, 2, 1)
+    dlg:add_label(lang["int_vlsub_work_dir"], 1, 12, 2, 1)
   end
 
   input_table['dir_path'] = dlg:add_text_input(
-    openSub.conf.dirPath, 2, 9, 2, 1)
+    openSub.conf.dirPath, 2, 12, 2, 1)
 
-  -- Row 10: Status message (moved up from row 11)
+  -- Row 13: OpenSubtitles status message
   input_table['message'] = nil
-  input_table['message'] = dlg:add_label('', 1, 10, 4, 1)
+  input_table['message'] = dlg:add_label('', 1, 13, 4, 1)
 
-  -- Row 11: Action buttons (moved up from row 12)
+  -- Row 14: SubSource status message
+  input_table['subsource_message'] = nil
+  input_table['subsource_message'] = dlg:add_label('', 1, 14, 4, 1)
+
+  -- Row 15: Action buttons
   dlg:add_button(
     "💾 " .. lang["int_save"],
-    apply_config, 1, 11, 1, 1)
+    apply_config, 1, 15, 1, 1)
 
   dlg:add_button(
     "❓ " .. lang["int_help"],
     function() show_help("config") end,
-    2, 11, 1, 1)
+    2, 15, 1, 1)
 
   dlg:add_button(
     "🔄 Check Updates",
-    function() check_for_updates(true) end, 3, 11, 1, 1)
+    function() check_for_updates(true) end, 3, 15, 1, 1)
 
   dlg:add_button(
     "❌ " .. lang["int_close"],
-    show_main, 4, 11, 1, 1)
+    show_main, 4, 15, 1, 1)
 
   -- Setup dropdown values for existing dropdowns
   input_table['langExt']:add_value(
@@ -1908,6 +3463,8 @@ function interface_config()
   assoc_select_conf('default_language', 'language', openSub.conf.languages, 2, lang["int_all"])
   assoc_select_conf('default_language2', 'language2', openSub.conf.languages, 2, 'None')
   assoc_select_conf('default_language3', 'language3', openSub.conf.languages, 2, 'None')
+  assoc_select_conf('ai_model', 'ai_model', {{"tiny", "Tiny (Multi)"}, {"base", "Base (Multi)"}, {"tiny.en", "Tiny (English Only)"}, {"base.en", "Base (English Only)"}}, 2, "Tiny (Multi)")
+  assoc_select_conf('ai_language_cfg', 'ai_language', get_filtered_ai_languages(true), 2, 'Auto')
   assoc_select_conf('downloadBehaviour', 'downloadBehaviour', openSub.conf.downloadBehaviours, 1)
 end
 
@@ -2043,10 +3600,13 @@ function should_auto_search()
        (guessit.season and guessit.episode) then
       has_useful_guessit_data = true
       if openSub.option.debugLogging then
+        local g_title = type(guessit.title) == "table" and (guessit.title[1] or "") or tostring(guessit.title or "none")
+        local g_season = type(guessit.season) == "table" and (guessit.season[1] or "") or tostring(guessit.season or "none")
+        local g_episode = type(guessit.episode) == "table" and (guessit.episode[1] or "") or tostring(guessit.episode or "none")
         vlc.msg.dbg("[VLSub] GuessIt provided useful data - title: " ..
-                    (guessit.title or "none") .. ", season: " ..
-                    (guessit.season or "none") .. ", episode: " ..
-                    (guessit.episode or "none"))
+                    g_title .. ", season: " ..
+                    g_season .. ", episode: " ..
+                    g_episode)
       end
     end
   end
@@ -2166,7 +3726,7 @@ end
 
 function close_dlg()
   vlc.msg.dbg("[VLSub] Closing dialog")
-
+  ai_abort_transcription()
   if dlg ~= nil then
     --~ dlg:delete() -- Throw an error
     dlg:hide()
@@ -2251,6 +3811,10 @@ end
 function display_subtitles()
   local mainlist = input_table["mainlist"]
   mainlist:clear()
+
+  if openSub.lastSearchMethod ~= "subsource" and openSub.lastSearchMethod ~= "subsource_fallback" then
+    clear_pagination_state()
+  end
 
   -- Safe check for no results - FIXED to avoid string/number comparison error
   local hasNoResults = false
@@ -2439,6 +4003,10 @@ function buildSubtitleDisplayText(item, langCode)
 
   -- Add language code at the beginning with spaces (e.g., "EN | ")
   displayText = string.upper(langCode) .. " | "
+
+  if item.Provider == "SubSource" then
+    displayText = displayText .. "[SubSource] "
+  end
 
   -- Add filename/release name
   displayText = displayText .. (item.SubFileName or "???")
@@ -2876,13 +4444,15 @@ function apply_config()
     end
   end
 
-  -- Get username and password, trim whitespace
+  -- Get username, password, and SubSource API key, trim whitespace
   local username = trim(input_table['os_username']:get_text() or "")
   local password = trim(input_table['os_password']:get_text() or "")
+  local subsource_key = trim(input_table['subsource_api_key'] and input_table['subsource_api_key']:get_text() or "")
 
   -- Set the trimmed values
   openSub.option.os_username = username
   openSub.option.os_password = password
+  openSub.option.subsource_api_key = (subsource_key ~= "" and subsource_key or nil)
 
   -- Save boolean options (these should always be saved regardless of login status)
   if input_table["langExt"]:get_value() == 2 then
@@ -2906,11 +4476,11 @@ function apply_config()
     or not dir_path then
       local other_dirs = {}
 
-      for path in
+      for raw_path in
       vlc.config.get(
         "sub-autodetect-path"):gmatch("[^,]+"
       ) do
-        path = trim(path)
+        local path = trim(raw_path)
         if path ~= (openSub.conf.dirPath or "")..sub_dir then
           table.insert(other_dirs, path)
         end
@@ -2964,16 +4534,28 @@ function apply_config()
   end
 
 
-  -- NOW HANDLE LOGIN VALIDATION (after config is saved)
-  -- Check if we have credentials for login test
+  -- NOW HANDLE LOGIN VALIDATION & SUBSOURCE KEY VALIDATION (after config is saved)
+  -- 1. Validate SubSource API key if provided
+  if subsource_key ~= "" then
+    setSubsourceMessage(loading_tag("Validating SubSource Key..."))
+    local ss_ok, ss_info = subSource.validateKey(subsource_key)
+    if ss_ok then
+      setSubsourceMessage(success_tag("SubSource: API Key validated successfully!" .. subSource.getLimitsString()))
+    else
+      setSubsourceMessage(error_tag("SubSource: " .. ss_info .. subSource.getLimitsString()))
+    end
+  else
+    setSubsourceMessage("")
+  end
+
+  -- 2. Validate OpenSubtitles credentials
   if username == "" or password == "" then
-    -- No credentials provided - still show success for saved settings
     setMessage(success_tag("Configuration saved. Please enter OpenSubtitles.com credentials for full functionality."))
     is_authenticated = false
     return
   end
 
-  -- We have credentials, test login
+  -- We have OpenSubtitles credentials, test login
   setMessage(loading_tag("Testing login credentials..."))
 
   -- Clear any existing session to force fresh login for verification
@@ -2985,14 +4567,6 @@ function apply_config()
 
   if login_success then
     is_authenticated = true
-    -- Keep the successful message that was set by checkLoginAndUserInfo
-    local current_message = input_table["message"]:get_text()
-    if current_message and string.find(current_message, "Success") then
-      setMessage(current_message .. "<br>Configuration saved. You can now close this window.")
-    else
-      setMessage(success_tag("Configuration saved and login successful! You can now close this window."))
-    end
-
     -- Refresh the interface to show the enabled close button
     vlc.msg.dbg("[VLSub] Authentication successful, refreshing config interface")
     if dlg then
@@ -3001,17 +4575,10 @@ function apply_config()
   else
     -- Login failed, but config was still saved
     is_authenticated = false
-    local current_message = input_table["message"]:get_text()
-
-    -- Check if there's already an error message from the login attempt
-    if current_message and (string.find(current_message, "Error") or string.find(current_message, "failed")) then
-      -- Append config saved notice to existing error message
-      setMessage(current_message .. "<br><small>Note: Other configuration settings were saved successfully.</small>")
-    else
-      -- Generic login failure message with config saved notice
-      setMessage(error_tag("Login failed - please check your credentials.<br><small>Other configuration settings were saved successfully.</small>"))
+    local current_message = input_table["message"] and input_table["message"]:get_text() or ""
+    if current_message == "" then
+      setMessage(error_tag("OpenSubtitles.com: Login failed - please check your credentials."))
     end
-
     vlc.msg.dbg("[VLSub] Login failed but configuration was saved")
   end
 end
@@ -3488,6 +5055,28 @@ getFileInfo = function()
         '^([^/]+)%.([^%.]+)$')
     end
 
+    -- Check if item:name() or item:metas() has a richer display name (critical for IPTV streams like 44920.mkv)
+    local item_name = item.name and item:name()
+    local metas = item.metas and item:metas()
+    local meta_title = metas and (metas['title'] or metas['filename'])
+
+    if item_name and item_name ~= "" then
+      if string.match(file.name, "^%d+$") or string.find(item_name, "%.") or string.find(item_name, " ") then
+        file.completeName = item_name
+        local parsed_n = string.match(item_name, '^([^/]-)%.?([^%.]*)$')
+        if parsed_n and parsed_n ~= "" then
+          file.name = parsed_n
+        else
+          file.name = item_name
+        end
+      end
+    elseif meta_title and meta_title ~= "" then
+      if string.match(file.name, "^%d+$") then
+        file.completeName = meta_title
+        file.name = meta_title
+      end
+    end
+
     file.hasInput = true;
     file.cleanName = string.gsub(
       file.name,
@@ -3558,12 +5147,20 @@ getMovieInfo = function()
     end
   end
 
-  if infoString == '' then
-    -- read from metadata
+  -- If cleanName is empty or a numeric IPTV stream ID (e.g., "477590"), try VLC item metadata title
+  if (infoString == '' or string.match(infoString, "^%d+$")) and vlc.input and vlc.input.item() then
     local metas = vlc.input.item():metas()
-    if metas['title'] ~= nil then
+    if metas and metas['title'] and metas['title'] ~= '' then
       infoString = metas['title']
     end
+  end
+
+  local function get_str_val(val)
+    if val == nil then return "" end
+    if type(val) == "table" then
+      return tostring(val[1] or "")
+    end
+    return tostring(val)
   end
 
   -- Try to use GuessIt data first if available
@@ -3571,7 +5168,7 @@ getMovieInfo = function()
     local guessit = openSub.file.guessit_data
 
     if guessit.title then
-      openSub.movie.title = guessit.title
+      openSub.movie.title = get_str_val(guessit.title)
     else
       -- Fallback to parsed title from filename
       openSub.movie.title = infoString
@@ -3579,20 +5176,20 @@ getMovieInfo = function()
 
     -- Set year from GuessIt
     if guessit.year then
-      openSub.movie.year = tostring(guessit.year)
+      openSub.movie.year = get_str_val(guessit.year)
     else
       openSub.movie.year = ""
     end
 
     -- Use GuessIt season/episode if available
     if guessit.season then
-      openSub.movie.seasonNumber = tostring(guessit.season)
+      openSub.movie.seasonNumber = get_str_val(guessit.season)
     else
       openSub.movie.seasonNumber = ""
     end
 
     if guessit.episode then
-      openSub.movie.episodeNumber = tostring(guessit.episode)
+      openSub.movie.episodeNumber = get_str_val(guessit.episode)
     else
       openSub.movie.episodeNumber = ""
     end
@@ -4053,12 +5650,21 @@ function searchIMBD_v2()
   -- No IMDB ID provided, use standard name search
   openSub.lastSearchMethod = "name" -- Track that this is a name search
 
+  local sn_text = trim(input_table["seasonNumber"]:get_text())
+  if sn_text ~= "" and not tonumber(sn_text) then
+    setMessage(error_tag("Season must be a number"))
+    return
+  end
+  local ep_text = trim(input_table["episodeNumber"]:get_text())
+  if ep_text ~= "" and not tonumber(ep_text) then
+    setMessage(error_tag("Episode must be a number"))
+    return
+  end
+
   openSub.movie.title = trim(input_table["title"]:get_text())
   openSub.movie.year = trim(input_table["year"]:get_text())  -- Capture year from input
-  openSub.movie.seasonNumber = tonumber(
-    input_table["seasonNumber"]:get_text())
-  openSub.movie.episodeNumber = tonumber(
-    input_table["episodeNumber"]:get_text())
+  openSub.movie.seasonNumber = tonumber(sn_text)
+  openSub.movie.episodeNumber = tonumber(ep_text)
   openSub.movie.imdbId = nil  -- Clear IMDB ID for name searches
 
   -- Debug: check available languages
@@ -4248,6 +5854,15 @@ function setMessage(str)
   if input_table["message"] then
     input_table["message"]:set_text(str)
     dlg:update()
+  end
+end
+
+function setSubsourceMessage(str)
+  if input_table["subsource_message"] then
+    input_table["subsource_message"]:set_text(str or "")
+    if dlg then
+      dlg:update()
+    end
   end
 end
 
@@ -4996,10 +6611,10 @@ function list_dir(path)
 
     if openSub.conf.os == "win" then
       -- Silent Windows directory listing
-      dir_list_cmd = io.popen('dir /b "' .. path .. '" 2>nul')
+      dir_list_cmd = io.popen('dir /b "' .. escape_cmd_win(path) .. '" 2>nul')
     else
       -- Silent Unix directory listing
-      dir_list_cmd = io.popen('ls -1 "' .. path .. '" 2>/dev/null')
+      dir_list_cmd = io.popen('ls -1 "' .. escape_cmd_posix(path) .. '" 2>/dev/null')
     end
 
     if dir_list_cmd then
@@ -5083,9 +6698,9 @@ function mkdir_p(path)
   -- Method 3: Fallback to silent OS commands only if VLC methods fail
   if not is_dir(path) then
     if openSub.conf.os == "win" then
-      os.execute('mkdir "' .. path .. '" >nul 2>&1')
+      os.execute('mkdir "' .. escape_cmd_win(path) .. '" >nul 2>&1')
     else
-      os.execute("mkdir -p '" .. path .. "' >/dev/null 2>&1")
+      os.execute("mkdir -p '" .. escape_cmd_posix(path) .. "' >/dev/null 2>&1")
     end
   end
 
@@ -5799,6 +7414,10 @@ function download_subtitles_v2()
   setMessage(openSub.actionLabel..": "..progressBarContent(10))
 
   local item = openSub.itemStore[index]
+
+  if item and item.Provider == "SubSource" then
+    return subSource.downloadSubtitle(item)
+  end
 
   -- Check if manual download is explicitly requested
   if openSub.option.downloadBehaviour == 'manual' then
@@ -7996,17 +9615,14 @@ function build_sorted_url(base_url, params_table)
     -- Convert filtered params table to array for sorting
     local sorted_params = {}
     for key, value in pairs(filtered_params) do
-        -- Check if this is an x-* parameter (should preserve case)
-        local is_x_param = string.match(string.lower(key), "^x%-") ~= nil
-
-        -- Convert parameter name to lowercase (except x-* params)
-        local processed_key = is_x_param and key or string.lower(key)
+        -- Preserve original key casing (camelCase like searchType must not be lowercased)
+        local processed_key = key
         local processed_value = tostring(value)
 
-        -- Only apply ID cleanup for non-x-* parameters
-        if not is_x_param then
-            -- Clean up IMDB IDs: remove 'tt' prefix and leading zeros
-            if processed_key == "imdb_id" then
+        -- Clean up IMDB IDs: remove 'tt' prefix and leading zeros
+        do
+            local lkey = string.lower(processed_key)
+            if lkey == "imdb_id" then
                 -- Remove 'tt' prefix if present (case-insensitive)
                 processed_value = string.gsub(processed_value, "^[Tt][Tt]", "")
                 -- Remove leading zeros
@@ -8026,8 +9642,7 @@ function build_sorted_url(base_url, params_table)
                 end
             end
 
-            -- Convert value to lowercase (except for x-* params)
-            processed_value = string.lower(processed_value)
+            -- NOTE: Do NOT lowercase values — this would corrupt API keys and other case-sensitive values
         end
 
         table.insert(sorted_params, {key = processed_key, value = processed_value})
@@ -8153,27 +9768,28 @@ openSub.searchSubtitlesNewAPI = function()
     vlc.msg.err("[VLSub] 301 Redirect - URL parameters may not be sorted correctly")
     vlc.msg.err("[VLSub] URL was: " .. url)
     openSub.itemStore = "0"
-  elseif res and res.status == 401 then
-    -- Token expired or invalid, try to re-login
-    vlc.msg.dbg("[VLSub] Authentication failed, attempting re-login")
-    openSub.session.token = ""
-    openSub.session.token_expires = 0
-    if openSub.checkSession() then
-      -- Retry the search with new token
-      openSub.searchSubtitlesNewAPI()
+    elseif res and res.status == 401 then
+      -- Token expired or invalid, try to re-login
+      vlc.msg.dbg("[VLSub] Authentication failed, attempting re-login")
+      openSub.session.token = ""
+      openSub.session.token_expires = 0
+      if openSub.checkSession() then
+        -- Retry the search with new token
+        openSub.searchSubtitlesNewAPI()
+      else
+        openSub.itemStore = "0"
+        setMessage(error_tag("Auth failed: Incorrect OpenSubtitles credentials. Check config."))
+      end
+    elseif res and res.status then
+      vlc.msg.err("[VLSub] API request failed with status: " .. res.status)
+      if res.body then
+        vlc.msg.err("[VLSub] Error response: " .. res.body)
+      end
+      openSub.itemStore = "0"
     else
+      vlc.msg.err("[VLSub] API request failed - no response")
       openSub.itemStore = "0"
     end
-  elseif res and res.status then
-    vlc.msg.err("[VLSub] API request failed with status: " .. res.status)
-    if res.body then
-      vlc.msg.err("[VLSub] Error response: " .. res.body)
-    end
-    openSub.itemStore = "0"
-  else
-    vlc.msg.err("[VLSub] API request failed - no response")
-    openSub.itemStore = "0"
-  end
 end
 
 -- Updated searchSubtitlesByHashNewAPI function with sorted parameters
@@ -8309,7 +9925,7 @@ openSub.searchSubtitlesByHashNewAPI = function()
             return
         else
             openSub.itemStore = {} -- Set to empty table
-            setMessage(error_tag(lang["mess_unauthorized"]))
+            setMessage(error_tag("Auth failed: Incorrect OpenSubtitles credentials. Check config."))
         end
     elseif res and res.status == 429 then
         -- Rate limiting error
@@ -8380,18 +9996,22 @@ function VLCHttpClient:_build_url_params(url, data)
 
     -- Step 2: Add headers as URL parameters (these will override any existing ones with same names)
     for key, value in pairs(self.headers) do
+        local k_lower = key:lower()
         local param_name
-        if key:lower() == "authorization" then
+        if k_lower == "authorization" or k_lower == "x-authorization" then
             param_name = "x-authorization"
-        elseif key:lower() == "api-key" then
+        elseif k_lower == "api-key" or k_lower == "x-api-key" then
             param_name = "x-api-key"
-        elseif key:lower() == "content-type" then
+        elseif k_lower == "content-type" or k_lower == "x-content-type" then
             param_name = "x-content-type"
-        elseif key:lower() == "user-agent" then
-            -- Also send user-agent as x-user-agent for server-side tracking
+        elseif k_lower == "user-agent" or k_lower == "x-user-agent" then
             param_name = "x-user-agent"
+        elseif k_lower == "accept" or k_lower == "x-accept" then
+            param_name = "x-accept"
+        elseif string.sub(k_lower, 1, 2) == "x-" then
+            param_name = k_lower
         else
-            param_name = "x-" .. key:lower():gsub("-", "-")
+            param_name = "x-" .. k_lower
         end
         if param_name then
             all_params[param_name] = value
@@ -8613,7 +10233,7 @@ local function clean_response_body(body, headers)
     return cleaned
 end
 
-function VLCHttpClient:_make_request_stream(method, url, data)
+function VLCHttpClient:_make_request_stream(method, url, data, is_binary)
     vlc.msg.dbg("[VLSub] Using optimized vlc.stream for HTTPS request")
 
     -- Build final URL with minimal parameters to reduce URL length
@@ -8627,7 +10247,7 @@ function VLCHttpClient:_make_request_stream(method, url, data)
 
     local response_data = ""
     local chunk_size = 16384  -- Larger chunks for better performance
-    local max_size = 1048576  -- 1MB limit
+    local max_size = 10485760 -- 10MB limit (subtitles can be a few MB if zipped)
     local bytes_read = 0
 
     -- Read with timeout
@@ -8647,8 +10267,8 @@ function VLCHttpClient:_make_request_stream(method, url, data)
         response_data = response_data .. chunk
         bytes_read = bytes_read + #chunk
 
-        -- Early break if we detect end of JSON
-        if string.find(chunk, "}$") and string.find(response_data, "^{") then
+        -- Early break if we detect end of JSON (only if not binary)
+        if not is_binary and string.find(chunk, "}$") and string.find(response_data, "^{") then
             vlc.msg.dbg("[VLSub] Detected complete JSON, stopping read")
             break
         end
@@ -8658,7 +10278,7 @@ function VLCHttpClient:_make_request_stream(method, url, data)
                 string.format("%.2f", (os.clock() - start_time)) .. " seconds")
 
     if bytes_read > 0 then
-        local cleaned_body = clean_response_body(response_data, {})
+        local cleaned_body = is_binary and response_data or clean_response_body(response_data, {})
         return {
             status = 200,
             headers = {},
@@ -8670,7 +10290,7 @@ function VLCHttpClient:_make_request_stream(method, url, data)
 end
 
 -- Use vlc.net.connect_tcp for HTTP requests
-function VLCHttpClient:_make_request_tcp(method, url, data)
+function VLCHttpClient:_make_request_tcp(method, url, data, is_binary)
     local host, path, option, protocol = parse_url(url)
     local port = (protocol == "https") and 443 or 80
     if not protocol or not host then
@@ -8928,7 +10548,7 @@ function VLCHttpClient:_make_request_tcp(method, url, data)
                     end
 
                     -- Clean the response body to handle chunked encoding and other artifacts
-                    local cleaned_body = clean_response_body(body, headers)
+                    local cleaned_body = is_binary and body or clean_response_body(body, headers)
 
                     if openSub.option.debugLogging then
                       vlc.msg.dbg("[VLSub] Cleaned body: " .. string.len(cleaned_body) .. " bytes")
@@ -8958,7 +10578,7 @@ function VLCHttpClient:_make_request_tcp(method, url, data)
 end
 
 -- Main request method - chooses implementation based on protocol
-function VLCHttpClient:_make_request(method, url, data)
+function VLCHttpClient:_make_request(method, url, data, is_binary)
     -- Log the full URL for complete visibility
     vlc.msg.warn("[VLSub] " .. method .. " " .. url)
 
@@ -8973,15 +10593,15 @@ function VLCHttpClient:_make_request(method, url, data)
     -- HTTPS -> use vlc.stream
     -- HTTP -> use vlc.net.connect_tcp
     if protocol == "https" then
-        return self:_make_request_stream(method, url, data)
+        return self:_make_request_stream(method, url, data, is_binary)
     else
-        return self:_make_request_tcp(method, url, data)
+        return self:_make_request_tcp(method, url, data, is_binary)
     end
 end
 
 -- Public HTTP methods
-function VLCHttpClient:get(url)
-    return self:_make_request("GET", url)
+function VLCHttpClient:get(url, is_binary)
+    return self:_make_request("GET", url, nil, is_binary)
 end
 
 function VLCHttpClient:post(url, data)

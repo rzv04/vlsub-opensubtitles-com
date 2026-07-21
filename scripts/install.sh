@@ -61,6 +61,89 @@ detect_platform() {
     esac
 }
 
+# Check for unzip (required for SubSource extraction on Linux/macOS)
+check_unzip() {
+    if [ "$PLATFORM" = "Windows" ]; then
+        return
+    fi
+    
+    echo "Checking for unzip utility..."
+    if command -v unzip &> /dev/null; then
+        printf "${GREEN}✓ unzip found${NC}\n"
+    else
+        printf "${YELLOW}⚠ unzip not found.${NC}\n"
+        if [ "$PLATFORM" = "Linux" ]; then
+            echo "Attempting to install unzip..."
+            if command -v apt &> /dev/null; then
+                sudo apt update && sudo apt install -y unzip
+            elif command -v dnf &> /dev/null; then
+                sudo dnf install -y unzip
+            elif command -v pacman &> /dev/null; then
+                sudo pacman -S --noconfirm unzip
+            else
+                echo "Please install 'unzip' manually using your package manager."
+                exit 1
+            fi
+            
+            if command -v unzip &> /dev/null; then
+                printf "${GREEN}✓ unzip installed successfully${NC}\n"
+            else
+                printf "${RED}✗ Failed to install unzip. Please install it manually.${NC}\n"
+                exit 1
+            fi
+        else
+            echo "Please install 'unzip' manually."
+            exit 1
+        fi
+    fi
+}
+
+# Check AI Transcription dependencies (ffmpeg, yt-dlp)
+check_ai_deps() {
+    echo "Checking AI Transcription dependencies..."
+    
+    # ffmpeg
+    if command -v ffmpeg &> /dev/null; then
+        printf "${GREEN}✓ ffmpeg found: $(command -v ffmpeg)${NC}\n"
+    else
+        printf "${YELLOW}⚠ ffmpeg not found on PATH${NC}\n"
+        printf "  ffmpeg will be auto-downloaded on first AI transcription use (Windows only).\n"
+        printf "  Or install manually:\n"
+        case "$PLATFORM" in
+            "macOS")
+                printf "  ${BLUE}brew install ffmpeg${NC}\n"
+                ;;
+            "Linux")
+                printf "  ${BLUE}Ubuntu/Debian: sudo apt install ffmpeg${NC}\n"
+                printf "  ${BLUE}Fedora: sudo dnf install ffmpeg${NC}\n"
+                printf "  ${BLUE}Arch: sudo pacman -S ffmpeg${NC}\n"
+                ;;
+        esac
+    fi
+    
+    # ffprobe (bundled with ffmpeg)
+    if command -v ffprobe &> /dev/null; then
+        printf "${GREEN}✓ ffprobe found: $(command -v ffprobe)${NC}\n"
+    elif ! command -v ffmpeg &> /dev/null; then
+        printf "${YELLOW}⚠ ffprobe not found (will be available when ffmpeg is installed)${NC}\n"
+    fi
+    
+    # yt-dlp (optional, for YouTube URL support)
+    if command -v yt-dlp &> /dev/null; then
+        printf "${GREEN}✓ yt-dlp found: $(command -v yt-dlp)${NC}\n"
+    else
+        printf "${YELLOW}⚠ yt-dlp not found (optional - needed for YouTube AI transcription)${NC}\n"
+        case "$PLATFORM" in
+            "macOS")
+                printf "  ${BLUE}Install: brew install yt-dlp  OR  pip install yt-dlp${NC}\n"
+                ;;
+            "Linux")
+                printf "  ${BLUE}Install: pip install yt-dlp  OR  sudo apt install yt-dlp${NC}\n"
+                ;;
+        esac
+    fi
+}
+
 # Check if VLC is installed
 check_vlc() {
     echo "Checking for VLC installation..."
@@ -179,6 +262,11 @@ show_completion() {
     printf "• ${BLUE}Hash search:${NC} For exact subtitle matches\n"
     printf "• ${BLUE}Name search:${NC} For flexible title-based search\n"
     printf "• ${BLUE}Double-click subtitle${NC} to download and load\n"
+    printf "• ${BLUE}AI Transcription:${NC} Live speech-to-text (local, network, live streams)\n"
+    echo
+    printf "${YELLOW}AI Transcription Dependencies:${NC}\n"
+    printf "• ${BLUE}ffmpeg:${NC} Required - install via package manager or https://ffmpeg.org/\n"
+    printf "• ${BLUE}yt-dlp:${NC} Optional - for YouTube URL transcription (pip install yt-dlp)\n"
     echo
     printf "${YELLOW}Support & Documentation:${NC}\n"
     printf "• ${BLUE}Issues:${NC} https://github.com/opensubtitles/vlsub-opensubtitles-com/issues\n"
@@ -197,6 +285,12 @@ main() {
     echo
     
     check_vlc
+    echo
+    
+    check_unzip
+    echo
+    
+    check_ai_deps
     echo
     
     create_directory

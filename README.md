@@ -44,31 +44,20 @@ A modern VLC extension for downloading subtitles from **OpenSubtitles.com** usin
 
 **macOS/Linux:**
 ```bash
-curl -sSL https://raw.githubusercontent.com/opensubtitles/vlsub-opensubtitles-com/main/scripts/install.sh | bash
+curl -sSL https://raw.githubusercontent.com/rzv04/vlsub-opensubtitles-com/main/scripts/install.sh | bash
 ```
 
 
 **Windows (PowerShell):**
 *Press `Windows + R` → type `powershell` → Enter, then run:*
 ```powershell
-Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser; iwr -useb https://raw.githubusercontent.com/opensubtitles/vlsub-opensubtitles-com/main/scripts/install.ps1 | iex
+Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser; iwr -useb https://raw.githubusercontent.com/rzv04/vlsub-opensubtitles-com/main/scripts/install.ps1 | iex
 ```
 
-### Method 2: Arch User Repository (Arch Linux)
 
-**With paru:**
-```bash
-paru -S vlsub-opensubtitles-com-git
-```
+### Method 2: Manual Installation
 
-**With yay:**
-```bash
-yay -S vlsub-opensubtitles-com-git
-```
-
-### Method 3: Manual Installation
-
-1. **Download** the latest `vlsubcom.lua` from [Releases](https://github.com/opensubtitles/vlsub-opensubtitles-com/releases)
+1. **Download** the latest `vlsubcom.lua` from [Releases](https://github.com/rzv04/vlsub-opensubtitles-com/releases)
 2. **Copy** to your VLC extensions directory:
    - **Windows**: `%APPDATA%\vlc\lua\extensions\`
    - **macOS**: `~/Library/Application Support/org.videolan.vlc/lua/extensions/`
@@ -82,8 +71,10 @@ yay -S vlsub-opensubtitles-com-git
 
 - **VLC Media Player** 3.0 or newer
 - **OpenSubtitles.com account** ([free registration](https://www.opensubtitles.com/newuser))
+- **Subsource.net API Key (Optional)** ([free registration](https://subsource.net/dashboard/profile))
 - **Internet connection** for searching and downloading
 - **curl** command-line tool (for downloads - usually pre-installed)
+- **unzip** command-line tool (required for Linux/macOS users for SubSource extraction - usually pre-installed)
 
 ## 🎬 Usage
 
@@ -154,9 +145,9 @@ Full list available in the [language documentation](docs/languages.md).
 - Check if subtitle exists on OpenSubtitles.com
 
 **"Authentication failed"**
-- Verify OpenSubtitles.com credentials
+- Verify OpenSubtitles.com credentials and Subsource API Key in the config
 - Check internet connection
-- Ensure account is active (not banned)
+- Ensure account and/or API key are active (not banned)
 
 **"Download failed"**
 - Check download quota (free accounts have daily limits)
@@ -198,9 +189,9 @@ cd vlsub-opensubtitles-com
 ```
 
 ### Reporting Issues
-- 🐛 [Bug Reports](https://github.com/opensubtitles/vlsub-opensubtitles-com/issues/new?template=bug_report.md)
-- 💡 [Feature Requests](https://github.com/opensubtitles/vlsub-opensubtitles-com/issues/new?template=feature_request.md)
-- 💬 [Discussions](https://github.com/opensubtitles/vlsub-opensubtitles-com/discussions)
+- 🐛 [Bug Reports](https://github.com/rzv04/vlsub-opensubtitles-com/issues/new?template=bug_report.md)
+- 💡 [Feature Requests](https://github.com/rzv04/vlsub-opensubtitles-com/issues/new?template=feature_request.md)
+- 💬 [Discussions](https://github.com/rzv04/vlsub-opensubtitles-com/discussions)
 
 ## 📄 License
 
@@ -209,6 +200,7 @@ This project is licensed under the GNU General Public License v3.0 - see the [LI
 ## 🙏 Acknowledgments
 
 - **OpenSubtitles.com** for providing the subtitle database and API
+- **Subsource.net** for providing the subtitle download functionality 
 - **VideoLAN Team** for VLC Media Player
 - **Original vlsub authors** for inspiration
 - **GuessIt project** for metadata extraction
@@ -226,8 +218,8 @@ This project is licensed under the GNU General Public License v3.0 - see the [LI
 
 - 📖 **Documentation**: [docs/](docs/)
 - 🆘 **FAQ**: [docs/faq.md](docs/faq.md)
-- 💬 **Community**: [GitHub Discussions](https://github.com/opensubtitles/vlsub-opensubtitles-com/discussions)
 - 📧 **OpenSubtitles Support**: [Contact](https://www.opensubtitles.com/contact)
+- 📧 **Subsource Support**: [Contact](https://subsource.net/dashboard/support)
 
 ---
 
