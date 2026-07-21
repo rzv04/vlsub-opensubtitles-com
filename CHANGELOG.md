@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.0-beta] - 2026-07-21
+
+### Added
+- **SubSource Subtitle Search & API Integration**: Integrated SubSource.net as a primary subtitle provider alongside OpenSubtitles.com with direct search and pagination support (`Show more` results).
+- **SubSource Rate Limiting & Usage Tracking**: Implemented client-side API rate limit tracking (per minute, hour, day) to stay within SubSource limit thresholds.
+- **SubSource Security & Log Masking**: Added API key validation, direct account dashboard link, and automatic masking of API keys in debug logs.
+- **SubSource API Key UI Layout**: Consolidated SubSource API Key help link and input field onto a single row to optimize configuration dialog spacing.
+- **AI Audio Transcription Support**: Initial preview integration for local audio transcription with Whisper AI models (`tiny.en`, `base.en`).
+
+### Fixed
+- **Buffer & Timestamp Transitions**: Fixed timestamp shifting, seek-back resume, and buffer underrun errors during subtitle transcription.
+- **Playlist State Tracking**: Prevented unintended playlist resume by tracking playback state during subtitle buffering transitions.
+- **Local File URI Resolution**: Resolved local file URIs to native Windows paths and updated FFmpeg downloading to use fast BtbN mirrors.
+- **SRT & Formatting Stability**: Corrected SRT regex escaping, Lua `%%` format string escaping, cached subtitles variable references, and I/O caching for enhanced stability.
+- **PowerShell Installer Fixes**: Explicitly cast integer values for PowerShell `-f D2/D3` format specifiers.
+
 ## [1.2.9] - 2026-06-09
 
 ### Fixed
