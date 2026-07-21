@@ -1,0 +1,96 @@
+name: CI & Smoke Tests
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  smoke-tests:
+    name: Smoke Tests & Syntax Verification
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Lua
+        uses: leafo/gh-actions-lua@v10
+        with:
+          luaVersion: "5.2"
+
+      - name: Verify file structure & statistics
+        run: |
+          echo "Checking vlsubcom.lua..."
+          if [ ! -f "vlsubcom.lua" ]; then
+            echo "Error: vlsubcom.lua not found!"
+            exit 1
+          fi
+
+          FILE_SIZE=$(wc -c < vlsubcom.lua)
+          LINE_COUNT=$(wc -l < vlsubcom.lua)
+          echo "File size: $FILE_SIZE bytes"
+          echo "Line count: $LINE_COUNT lines"
+
+          if [ $FILE_SIZE -lt 10000 ]; then
+            echo "Error: File size is suspiciously small!"
+            exit 1
+          fi
+          echo "SUCCESS: File integrity check passed."
+
+      - name: Test Lua Syntax (luac)
+        run: |
+          echo "Checking Lua syntax..."
+          luac -p vlsubcom.lua
+          echo "SUCCESS: No syntax errors found."
+
+      - name: Run Extension Descriptor Smoke Test
+        run: |
+          echo "Testing extension descriptor loading..."
+          lua -e '
+            -- Mock basic VLC extension environment
+            vlc = {
+              msg = { dbg = function() end, err = function() end, info = function() end, warn = function() end },
+              config = { homedir = function() return "/tmp" end, userdatadir = function() return "/tmp" end }
+            }
+            dofile("vlsubcom.lua")
+
+            assert(type(descriptor) == "function", "descriptor() function missing!")
+            local d = descriptor()
+            assert(type(d) == "table", "descriptor() must return a table!")
+            assert(type(d.title) == "string" and #d.title > 0, "descriptor().title missing or empty!")
+            print("Extension Title: " .. d.title)
+            print("Extension Version: " .. (d.version or "N/A"))
+            assert(type(d.capabilities) == "table", "descriptor().capabilities missing!")
+            print("SUCCESS: Descriptor smoke test passed successfully!")
+          '
+
+      - name: Validate Bash Installer Script (install.sh)
+        run: |
+          echo "Validating scripts/install.sh syntax..."
+          test -f scripts/install.sh || (echo "Error: scripts/install.sh missing" && exit 1)
+          bash -n scripts/install.sh
+          if command -v shellcheck &> /dev/null; then
+            shellcheck --severity=error scripts/install.sh
+          fi
+          echo "SUCCESS: install.sh passed syntax and shellcheck validation."
+
+      - name: Validate PowerShell Installer Script (install.ps1)
+        run: |
+          echo "Validating scripts/install.ps1 syntax via PowerShell AST..."
+          test -f scripts/install.ps1 || (echo "Error: scripts/install.ps1 missing" && exit 1)
+          pwsh -Command '
+            $errors = $null
+            $tokens = $null
+            [System.Management.Automation.Language.Parser]::ParseFile("scripts/install.ps1", [ref]$tokens, [ref]$errors)
+            if ($errors) {
+              $errors | ForEach-Object { Write-Error $_ }
+              exit 1
+            } else {
+              Write-Host "SUCCESS: PowerShell script syntax is valid."
+            }
+          '
