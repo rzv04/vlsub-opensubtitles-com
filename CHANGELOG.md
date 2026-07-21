@@ -15,6 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **SubSource Security & Log Masking**: Added API key validation, direct account dashboard link, and automatic masking of API keys in debug logs.
 - **SubSource API Key UI Layout**: Consolidated SubSource API Key help link and input field onto a single row to optimize configuration dialog spacing.
 - **AI Audio Transcription Support**: Initial preview integration for local audio transcription with Whisper AI models (`tiny.en`, `base.en`).
+- **Simple CI and smoke testing setup**: Added a simple CI and smoke testing setup on GitHub Actions on push and pull requests to main for the extension.
 
 ### Fixed
 - **Buffer & Timestamp Transitions**: Fixed timestamp shifting, seek-back resume, and buffer underrun errors during subtitle transcription.
