@@ -2595,10 +2595,10 @@ local function ai_parse_srt(filepath)
               state = 1
               current_sub = {text=""}
           elseif state == 1 then
-              local ts, te = string.match(line, "(%d%d:%d%d:%d%d,%d%d%d) %-%-%> (%d%d:%d%d:%d%d,%d%d%d)")
+              local ts, te = string.match(line, "(%d%d:%d%d:%d%d[%,%.]%d%d%d) %-%-%> (%d%d:%d%d:%d%d[%,%.]%d%d%d)")
               if ts and te then
                   local function parse_time(t)
-                      local h,m,s,ms = string.match(t, "(%d%d):(%d%d):(%d%d),(%d%d%d)")
+                      local h,m,s,ms = string.match(t, "(%d%d):(%d%d):(%d%d)[%,%.](%d%d%d)")
                       return tonumber(h)*3600 + tonumber(m)*60 + tonumber(s) + tonumber(ms)/1000
                   end
                   current_sub.start_s = parse_time(ts)
@@ -2741,7 +2741,7 @@ $chunk_ready = "%s"
 $chunks_dir = "%s"
 $ffmpeg_exe = "$ai_dir\ffmpeg.exe"
 $ffprobe_exe = "$ai_dir\ffprobe.exe"
-$chunk_seconds = 30
+$chunk_seconds = if ($is_live) { 10 } else { 30 }
 
 if (Test-Path $abort_flag) { Remove-Item $abort_flag }
 if (Test-Path $done_flag) { Remove-Item $done_flag }
@@ -2864,7 +2864,17 @@ if ($resolved_uri -match "youtube\.com|youtu\.be") {
 # --- Detect finite vs. live stream via ffprobe ---
 $is_live = $true
 $total_chunks = [int]::MaxValue
-if (Test-Path $ffprobe_exe) {
+if ($video_uri -match "^http://|^https://|^rtsp://|^rtmp://|^udp://") {
+    # Check if stream has a full duration > 180s (VOD)
+    if (Test-Path $ffprobe_exe) {
+        $dur_str = & $ffprobe_exe -v error -show_entries format=duration -of csv=p=0 $resolved_uri 2>$null
+        $duration = 0
+        if ([double]::TryParse($dur_str, [ref]$duration) -and $duration -gt 180) {
+            $is_live = $false
+            $total_chunks = [math]::Ceiling($duration / $chunk_seconds)
+        }
+    }
+} elseif (Test-Path $ffprobe_exe) {
     $dur_str = & $ffprobe_exe -v error -show_entries format=duration -of csv=p=0 $resolved_uri 2>$null
     $duration = 0
     if ([double]::TryParse($dur_str, [ref]$duration) -and $duration -gt 0) {
@@ -2927,8 +2937,8 @@ while ($true) {
     $chunk_wav = "$chunks_dir\$chunk_name.wav"
     
     if ($is_live) {
-        # Live: no seeking, just record the next N seconds
-        $ffArgs = @("-y", "-i", $resolved_uri, "-t", $chunk_seconds, "-ac", "1", "-ar", "16000", $chunk_wav)
+        # Live: no seeking, just record the next N seconds with reconnect flags for network stability
+        $ffArgs = @("-y", "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "2", "-i", $resolved_uri, "-t", $chunk_seconds, "-ac", "1", "-ar", "16000", $chunk_wav)
     } else {
         # Finite: seek to offset and extract chunk
         $ffArgs = @("-y", "-ss", $offset, "-t", $chunk_seconds, "-i", $resolved_uri, "-ac", "1", "-ar", "16000", $chunk_wav)
@@ -2959,7 +2969,7 @@ while ($true) {
         $srtLines = Get-Content $chunk_srt
         $shifted = @()
         foreach ($srtLine in $srtLines) {
-            if ($srtLine -match '^(\d{2}):(\d{2}):(\d{2}),(\d{3}) --> (\d{2}):(\d{2}):(\d{2}),(\d{3})$') {
+            if ($srtLine -match '^(\d{2}):(\d{2}):(\d{2})[,.](\d{3}) --> (\d{2}):(\d{2}):(\d{2})[,.](\d{3})$') {
                 $st = [int]$Matches[1]*3600 + [int]$Matches[2]*60 + [int]$Matches[3] + [int]$Matches[4]/1000 + $offset
                 $et = [int]$Matches[5]*3600 + [int]$Matches[6]*60 + [int]$Matches[7] + [int]$Matches[8]/1000 + $offset
                 $fmtTime = { param($t) $h=[int][math]::Floor($t/3600); $m=[int][math]::Floor(($t%%3600)/60); $s=[int][math]::Floor($t%%60); $ms=[int][math]::Floor(($t%%1)*1000); "{0:D2}:{1:D2}:{2:D2},{3:D3}" -f $h,$m,$s,$ms }
@@ -2993,10 +3003,35 @@ while ($true) {
   os.execute(string.format('start /b /belownormal powershell -ExecutionPolicy Bypass -WindowStyle Hidden -File "%s"', escape_cmd_win(ps1_file)))
 
   local init_input = vlc.object.input()
+  local item_dur = item:duration()
+  local init_len = init_input and vlc.var.get(init_input, "length") or -1
+  local can_seek = init_input and vlc.var.get(init_input, "can-seek")
+
+  local num_dur = tonumber(item_dur) or 0
+  local num_len = tonumber(init_len) or 0
+  local can_seek_val = (can_seek == true or can_seek == 1)
+
+  local is_file_protocol = (string.match(video_uri, "^file://") ~= nil) or (string.match(video_uri, "^[a-zA-Z]:") ~= nil)
+
+  local is_live_stream = false
+  if not is_file_protocol then
+      -- Network stream: Live if zero/missing duration, non-seekable, or sliding window duration (<= 180s)
+      if (num_dur <= 0) or (num_len <= 0) or (not can_seek_val) or (num_dur <= 180) then
+          is_live_stream = true
+      end
+  else
+      -- Local file: Live only if invalid/zero duration
+      if (num_dur <= 0) or (num_len <= 0) then
+          is_live_stream = true
+      end
+  end
+
+  vlc.msg.dbg("[VLSub] Stream detection: uri=" .. tostring(video_uri) .. ", num_dur=" .. tostring(num_dur) .. ", can_seek=" .. tostring(can_seek) .. ", is_file=" .. tostring(is_file_protocol) .. ", is_live_stream=" .. tostring(is_live_stream))
+
   local should_play_after_chunk = (vlc.playlist.status() == "playing")
 
-  -- Pause VLC until first chunk is transcribed
-  if should_play_after_chunk then
+  -- Pause VLC until first chunk is transcribed (only for finite files, NOT live streams)
+  if should_play_after_chunk and not is_live_stream then
       vlc.playlist.pause()
   end
   vlc.osd.message("AI: Preparing subtitles...", ai_osd_ch_status, "center", 10000000)
@@ -3012,7 +3047,8 @@ while ($true) {
   -- OSD Polling Loop
   local last_status = ""
   local last_known_time = (init_time or 0) / 1000000
-  local is_paused_for_chunk = true  -- Start paused, waiting for first chunk
+  local is_paused_for_chunk = (should_play_after_chunk and not is_live_stream)  -- Start paused only for finite files
+  local live_start_clock = os.clock()
   local cached_chunks_done = {}     -- Cache completed chunk indices
   local cached_subs = {}            -- Cache parsed SRT entries
   local last_live_size = 0          -- Track .live file size for cache invalidation
@@ -3021,21 +3057,17 @@ while ($true) {
       -- Check done flag
       if ai_file_exists(done_flag) then break end
 
-      -- 1. CLEAN SLEEP (Prevents Main VLC Player from lagging / CPU Starvation)
-      if vlc.mwait and vlc.mdate then
-          vlc.mwait(vlc.mdate() + 500000) -- Clean 500ms sleep at OS level (VLC 3+)
-      elseif vlc.misc and vlc.misc.mwait and vlc.misc.mdate then
-          vlc.misc.mwait(vlc.misc.mdate() + 500000) -- Clean 500ms sleep at OS level (VLC 2.x)
-      else
-          -- Fallback: use a dummy network poll to sleep safely without flashing a window or burning CPU
-          local dummy_fds = nil
-          if vlc.net and vlc.net.listen_tcp then dummy_fds = vlc.net.listen_tcp("127.0.0.1", 0) end
-          if dummy_fds and dummy_fds[1] and vlc.net.poll then
-              vlc.net.poll({[dummy_fds[1]] = vlc.net.POLLIN}, 500)
-              pcall(vlc.net.close, dummy_fds[1])
-          else
-              local delay_start = os.clock()
-              while (os.clock() - delay_start) < 0.5 do end
+      -- 1. CLEAN SLEEP (Hidden, no CMD windows, no sockets)
+      local sleep_ok = false
+      if vlc.misc and vlc.misc.mdate and vlc.misc.mwait then
+          sleep_ok = pcall(vlc.misc.mwait, vlc.misc.mdate() + 500000)
+      elseif vlc.mdate and vlc.mwait then
+          sleep_ok = pcall(vlc.mwait, vlc.mdate() + 500000)
+      end
+      if not sleep_ok then
+          local s = os.clock()
+          while (os.clock() - s) < 0.5 do
+              if vlc.keep_alive then vlc.keep_alive() end
           end
       end
       
@@ -3086,63 +3118,72 @@ while ($true) {
       end
       
       -- Fetch the time using the validated input
-      local current_time = vlc.var.get(current_input, "time")
-      if current_time then
-          current_time = current_time / 1000000
-          
-          -- Write seek hint for PowerShell chunk prioritization
-          local sh_w = io.open(seek_hint, "w")
-          if sh_w then sh_w:write(tostring(current_time)); sh_w:close() end
-          
-          -- Detect seek: time jumped more than 5 seconds from expected
-          if not is_paused_for_chunk and math.abs(current_time - last_known_time) > 5 then
-              -- User seeked! Pause and wait for chunk at new position
-              should_play_after_chunk = (vlc.playlist.status() == "playing")
-              if should_play_after_chunk then
-                  vlc.playlist.pause()
-              end
-              is_paused_for_chunk = true
-              vlc.osd.message("AI: Loading subtitles...", ai_osd_ch_status, "center", 10000000)
-              -- Remove old chunk_ready signal so we wait for a fresh one
-              os.remove(chunk_ready)
-          end
-          
-          -- Buffer underrun: check if current chunk has been transcribed
-          if not is_paused_for_chunk then
-              local current_chunk_idx = math.floor(current_time / 30)
-              -- Refresh chunks_done cache only when file changes
-              local cd_size = 0
-              local cd_check = io.open(chunks_done, "r")
-              if cd_check then
-                  cd_check:seek("end")
-                  cd_size = cd_check:seek()
-                  cd_check:close()
-              end
-              if cd_size ~= last_chunks_done_size then
-                  last_chunks_done_size = cd_size
-                  cached_chunks_done = {}
-                  local cd = io.open(chunks_done, "r")
-                  if cd then
-                      for cline in cd:lines() do
-                          local idx = tonumber(cline)
-                          if idx then cached_chunks_done[idx] = true end
-                      end
-                      cd:close()
-                  end
-              end
-              if not cached_chunks_done[current_chunk_idx] then
-                  -- Playback entered untranscribed territory, pause until ready
+      local raw_time = vlc.var.get(current_input, "time")
+      local current_time = raw_time and (raw_time / 1000000) or nil
+      local effective_time = current_time
+      if is_live_stream and (not effective_time or effective_time <= 0) then
+          effective_time = math.max(0, (os.clock() - live_start_clock) - 10)
+      end
+      
+      if current_time or is_live_stream then
+          if current_time then
+              -- Write seek hint for PowerShell chunk prioritization
+              local sh_w = io.open(seek_hint, "w")
+              if sh_w then sh_w:write(tostring(current_time)); sh_w:close() end
+              
+              -- Detect seek: time jumped more than 5 seconds from expected (finite streams only)
+              if not is_live_stream and not is_paused_for_chunk and math.abs(current_time - last_known_time) > 5 then
+                  -- User seeked! Pause and wait for chunk at new position
                   should_play_after_chunk = (vlc.playlist.status() == "playing")
                   if should_play_after_chunk then
                       vlc.playlist.pause()
                   end
                   is_paused_for_chunk = true
-                  vlc.osd.message("AI: Buffering subtitles...", ai_osd_ch_status, "center", 10000000)
+                  vlc.osd.message("AI: Loading subtitles...", ai_osd_ch_status, "center", 10000000)
+                  -- Remove old chunk_ready signal so we wait for a fresh one
                   os.remove(chunk_ready)
               end
+              
+              -- Buffer underrun: check if current chunk has been transcribed (finite streams only)
+              if not is_live_stream and not is_paused_for_chunk then
+                  local current_chunk_idx = math.floor(current_time / 30)
+                  -- Refresh chunks_done cache only when file changes
+                  local cd_size = 0
+                  local cd_check = io.open(chunks_done, "r")
+                  if cd_check then
+                      cd_check:seek("end")
+                      cd_size = cd_check:seek()
+                      cd_check:close()
+                  end
+                  if cd_size ~= last_chunks_done_size then
+                      last_chunks_done_size = cd_size
+                      cached_chunks_done = {}
+                      local cd = io.open(chunks_done, "r")
+                      if cd then
+                          for cline in cd:lines() do
+                              local idx = tonumber(cline)
+                              if idx then cached_chunks_done[idx] = true end
+                          end
+                          cd:close()
+                      end
+                  end
+                  if not cached_chunks_done[current_chunk_idx] then
+                      -- Playback entered untranscribed territory, pause until ready
+                      should_play_after_chunk = (vlc.playlist.status() == "playing")
+                      if should_play_after_chunk then
+                          vlc.playlist.pause()
+                      end
+                      is_paused_for_chunk = true
+                      vlc.osd.message("AI: Buffering subtitles...", ai_osd_ch_status, "center", 10000000)
+                      os.remove(chunk_ready)
+                  end
+              end
+              
+              -- Update expected time for next iteration (current + poll interval)
+              last_known_time = current_time + 0.5
           end
           
-          -- If paused waiting for chunk, check if it's ready
+          -- If paused waiting for chunk, check if it's ready (finite streams)
           if is_paused_for_chunk then
               if ai_file_exists(chunk_ready) then
                   -- Chunk at current position is transcribed, resume!
@@ -3154,9 +3195,6 @@ while ($true) {
                   vlc.osd.message("", ai_osd_ch_status, "center", 1)  -- clear status
               end
           end
-          
-          -- Update expected time for next iteration (current + poll interval)
-          last_known_time = current_time + 0.5
           
           -- OSD subtitle display (with file-size cache)
           local live_file = srt_out .. ".live"
@@ -3172,16 +3210,31 @@ while ($true) {
               cached_subs = ai_parse_srt(live_file) or {}
           end
           
-          local found_text = nil
-          for _, sub in ipairs(cached_subs) do
-              if current_time >= sub.start_s and current_time <= sub.end_s then
-                  found_text = sub.text
-                  break
+          if effective_time then
+              local max_end_s = 0
+              local last_sub_text = nil
+              local found_text = nil
+              for _, sub in ipairs(cached_subs) do
+                  if sub.end_s and sub.end_s > max_end_s then
+                      max_end_s = sub.end_s
+                      last_sub_text = sub.text
+                  end
+                  if effective_time >= sub.start_s and effective_time <= sub.end_s then
+                      found_text = sub.text
+                      break
+                  end
               end
-          end
-          
-          if found_text then
-              vlc.osd.message(found_text, ai_osd_ch_subs, "bottom", 1000000)
+              
+              -- For live streams: if time is slightly ahead of the latest parsed chunk, show recent subtitle
+              if not found_text and is_live_stream and #cached_subs > 0 then
+                  if effective_time > max_end_s and (effective_time - max_end_s) < 20 then
+                      found_text = last_sub_text
+                  end
+              end
+              
+              if found_text then
+                  vlc.osd.message(found_text, ai_osd_ch_subs, "bottom", 1000000)
+              end
           end
       end
   end
@@ -7672,20 +7725,12 @@ end
 function input_changed()
   collectgarbage()
 
-  -- Only update interface if not in config mode, or preserve messages in config mode
-  if dlg and dlg:get_title() and string.find(dlg:get_title(), "Configuration") then
-    -- In config mode - don't call set_interface_main which might clear messages
-    -- Just handle subtitle list clicks if any
-    if input_table["mainlist"] then
-      subtitle_list_click_handler()
-    end
-  else
-    -- In main mode - normal behavior
+  pcall(function()
     set_interface_main()
-    if input_table["mainlist"] then
+    if input_table and input_table["mainlist"] then
       subtitle_list_click_handler()
     end
-  end
+  end)
 
   collectgarbage()
 end
