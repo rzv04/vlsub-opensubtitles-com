@@ -3177,15 +3177,9 @@ if ($is_live) {
           end
           
           if effective_time then
-              local max_end_s = 0
-              local last_sub_text = nil
               local found_text = nil
               
               for _, sub in ipairs(cached_subs) do
-                  if sub.end_s and sub.end_s > max_end_s then
-                      max_end_s = sub.end_s
-                      last_sub_text = sub.text
-                  end
                   if effective_time >= sub.start_s and effective_time <= sub.end_s then
                       found_text = sub.text
                       break
