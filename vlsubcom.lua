@@ -2662,10 +2662,6 @@ function ai_start_transcription(status_label)
   if ai_is_running then return end
   ai_is_running = true
 
-  if input_table and input_table['ai_start'] then
-      input_table['ai_start']:set_text("⏹ Abort")
-  end
-
   -- Always register OSD channels to avoid invalid channel crashes on video switch
   ai_osd_ch_status = vlc.osd.channel_register()
   ai_osd_ch_hint = vlc.osd.channel_register()
@@ -2752,9 +2748,6 @@ function ai_start_transcription(status_label)
       return
   end
   
-  -- Hint to user on how to safely abort
-  vlc.osd.message("AI Transcription initiated. To abort, press Stop (■).", ai_osd_ch_hint, "bottom", 6000000)
-
   -- Write the background PowerShell script
   local f = io.open(ps1_file, "w")
   if not f then
@@ -3075,15 +3068,11 @@ if ($is_live) {
           break
       end
       
-      -- Update status label from file and push to OSD
+      -- Update status label in dialog UI
       local sf = io.open(status_file, "r")
       if sf then
           local s_text = sf:read("*line")
           sf:close()
-          if s_text and s_text ~= last_status then
-              vlc.osd.message("AI: " .. s_text, ai_osd_ch_status, "top-right", 3000000)
-              last_status = s_text
-          end
           if s_text and input_table and input_table['ai_status'] then
               input_table['ai_status']:set_text(s_text)
           end
@@ -3238,10 +3227,7 @@ if ($is_live) {
       input_table['ai_start']:set_text("🎙️ Transcribe")
   end
 
-  -- Signal completion
-  if vlc.input.item() then
-      vlc.osd.message("AI Transcription Complete!", ai_osd_ch_status, "top-right", 4000000)
-  end
+  -- Signal completion in UI dialog only
   if input_table and input_table['ai_status'] then
       input_table['ai_status']:set_text("Completed!")
   end
@@ -3258,7 +3244,6 @@ end
 
 function ai_start_transcription_proxy()
   if ai_is_running then
-    ai_abort_transcription()
     return
   end
 
