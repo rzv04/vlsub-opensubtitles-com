@@ -2625,11 +2625,11 @@ local function ai_parse_srt(filepath)
 end
 
 function ai_abort_transcription()
-  if not ai_is_running then return end
   local slash = package.config:sub(1,1)
   local ai_dir = openSub.conf.dirPath .. slash .. "vlsub_ai"
   local abort_flag = ai_dir .. slash .. "abort_flag.txt"
   local pid_file = ai_dir .. slash .. "pid.txt"
+  local chunks_dir = ai_dir .. slash .. "chunks"
   
   local pid_f = io.open(pid_file, "r")
   if pid_f then
@@ -2641,6 +2641,16 @@ function ai_abort_transcription()
   end
   local af = io.open(abort_flag, "w")
   if af then af:write("ABORT"); af:close() end
+
+  -- Cleanup temporary chunk files and flags to prevent disk space leaks
+  os.remove(ai_dir .. slash .. "whisper_done.txt")
+  os.remove(ai_dir .. slash .. "ai_runner.ps1")
+  os.remove(ai_dir .. slash .. "temp_audio.wav.srt.live")
+  os.remove(ai_dir .. slash .. "seek_hint.txt")
+  os.remove(ai_dir .. slash .. "chunks_done.txt")
+  os.remove(ai_dir .. slash .. "chunk_ready.txt")
+  os.execute('powershell -WindowStyle Hidden -Command "Remove-Item -Recurse -Force \'' .. escape_powershell(chunks_dir) .. '\' -ErrorAction SilentlyContinue"')
+
   ai_is_running = false
   if input_table and input_table['ai_start'] then
       input_table['ai_start']:set_text("🎙️ Transcribe")
@@ -2709,7 +2719,38 @@ function ai_start_transcription(status_label)
     return
   end
   local video_uri = item:uri()
-  -- Network streams and local files are both supported via chunked ffmpeg extraction
+
+  -- Deprecate Live Streams: Only allow VOD network videos and local files
+  local item_dur = item:duration()
+  local init_input = vlc.object.input()
+  local init_len = init_input and vlc.var.get(init_input, "length") or -1
+  local can_seek = init_input and vlc.var.get(init_input, "can-seek")
+
+  local num_dur = tonumber(item_dur) or 0
+  local num_len = tonumber(init_len) or 0
+  local can_seek_val = (can_seek == true or can_seek == 1)
+  local is_file_protocol = (string.match(video_uri, "^file://") ~= nil) or (string.match(video_uri, "^[a-zA-Z]:") ~= nil)
+
+  local is_live_stream = false
+  if not is_file_protocol then
+      if (num_dur <= 0) or (num_len <= 0) or (not can_seek_val) or (num_dur <= 180) then
+          is_live_stream = true
+      end
+  else
+      if (num_dur <= 0) or (num_len <= 0) then
+          is_live_stream = true
+      end
+  end
+
+  if is_live_stream then
+      status_label:set_text("Status: Error - Live streams not supported.")
+      vlc.osd.message("AI: Live streams are not supported. Only VOD & local files can be transcribed.", ai_osd_ch_status, "center", 5000000)
+      ai_is_running = false
+      if input_table and input_table['ai_start'] then
+          input_table['ai_start']:set_text("🎙️ Transcribe")
+      end
+      return
+  end
   
   -- Hint to user on how to safely abort
   vlc.osd.message("AI Transcription initiated. To abort, press Stop (■).", ai_osd_ch_hint, "bottom", 6000000)
@@ -2722,7 +2763,7 @@ function ai_start_transcription(status_label)
       return
   end
 
-  local ps_script = string.format([[
+local ps_script = string.format([[
 $ErrorActionPreference = "SilentlyContinue"
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 $PID | Out-File -FilePath "%s" -Encoding ascii
@@ -2741,7 +2782,6 @@ $chunk_ready = "%s"
 $chunks_dir = "%s"
 $ffmpeg_exe = "$ai_dir\ffmpeg.exe"
 $ffprobe_exe = "$ai_dir\ffprobe.exe"
-$chunk_seconds = if ($is_live) { 10 } else { 30 }
 
 if (Test-Path $abort_flag) { Remove-Item $abort_flag }
 if (Test-Path $done_flag) { Remove-Item $done_flag }
@@ -2756,122 +2796,21 @@ Function Check-Abort {
     return $false
 }
 
-Set-Content -Path $status_file -Value "Checking dependencies..."
-
-Function Download-FileWithProgress {
-    param($url, $destination, $label)
-    $tmpDest = "$destination.tmp"
-    $wc = New-Object System.Net.WebClient
-    try {
-        $stream = $wc.OpenRead($url)
-        $totalSize = [int]$wc.ResponseHeaders["Content-Length"]
-        $fileStream = [System.IO.File]::Create($tmpDest)
-        $buffer = New-Object byte[] 65536
-        $read = 0
-        $downloaded = 0
-        $lastPercent = -1
-        $dlChunks = 0
-        while (($read = $stream.Read($buffer, 0, $buffer.Length)) -gt 0) {
-            $fileStream.Write($buffer, 0, $read)
-            $downloaded += $read
-            $dlChunks++
-            
-            if ($totalSize -gt 0) {
-                $percent = [math]::Round(($downloaded / $totalSize) * 100)
-                if ($percent -ne $lastPercent) {
-                    Set-Content -Path $status_file -Value "$label $percent%%"
-                    $lastPercent = $percent
-                }
-            }
-            
-            if ($dlChunks %% 50 -eq 0) {
-                if (Check-Abort) {
-                    $fileStream.Close()
-                    $stream.Close()
-                    Remove-Item $tmpDest -Force -ErrorAction SilentlyContinue
-                    exit
-                }
-            }
-        }
-        $fileStream.Close()
-        $stream.Close()
-        if (Test-Path $destination) { Remove-Item $destination -Force }
-        Rename-Item -Path $tmpDest -NewName (Split-Path $destination -Leaf) -Force
-    } catch {
-        Set-Content -Path $status_file -Value "Error downloading $label"
-        exit
-    }
-}
-
-# --- Dependency: Whisper ---
-if (-not (Test-Path $whisper_exe)) {
-    Download-FileWithProgress -url "https://github.com/ggerganov/whisper.cpp/releases/download/v1.5.4/whisper-bin-x64.zip" -destination "$ai_dir\whisper-bin-x64.zip" -label "Downloading Whisper..."
-    Set-Content -Path $status_file -Value "Extracting Whisper..."
-    Expand-Archive -Force -Path "$ai_dir\whisper-bin-x64.zip" -DestinationPath $ai_dir
-}
-
-if (-not (Test-Path $model_bin)) {
-    Download-FileWithProgress -url "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-%s.bin" -destination $model_bin -label "Downloading Model..."
-}
-
-# --- Dependency: ffmpeg ---
-if (-not (Test-Path $ffmpeg_exe)) {
-    $sys_ffmpeg = (Get-Command ffmpeg -ErrorAction SilentlyContinue).Source
-    if ($sys_ffmpeg) {
-        $ffmpeg_exe = $sys_ffmpeg
-        $sys_ffprobe = (Get-Command ffprobe -ErrorAction SilentlyContinue).Source
-        if ($sys_ffprobe) { $ffprobe_exe = $sys_ffprobe }
-    } else {
-        Download-FileWithProgress -url "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip" -destination "$ai_dir\ffmpeg.zip" -label "Downloading ffmpeg..."
-        Set-Content -Path $status_file -Value "Extracting ffmpeg..."
-        Expand-Archive -Force -Path "$ai_dir\ffmpeg.zip" -DestinationPath "$ai_dir\ffmpeg_temp"
-        $bin_found = Get-ChildItem "$ai_dir\ffmpeg_temp" -Recurse -Filter "ffmpeg.exe" | Select-Object -First 1
-        if ($bin_found) {
-            Copy-Item $bin_found.FullName $ffmpeg_exe
-            $probe_found = Join-Path $bin_found.DirectoryName "ffprobe.exe"
-            if (Test-Path $probe_found) { Copy-Item $probe_found $ffprobe_exe }
-        }
-        Remove-Item "$ai_dir\ffmpeg_temp" -Recurse -Force -ErrorAction SilentlyContinue
-        Remove-Item "$ai_dir\ffmpeg.zip" -Force -ErrorAction SilentlyContinue
-    }
-}
-
-if (-not (Test-Path $ffmpeg_exe)) {
-    Set-Content -Path $status_file -Value "Error: ffmpeg not found and download failed."
-    exit
-}
-
-# --- Resolve URI to local path if it is a local file ---
 $resolved_uri = $video_uri
 if ($video_uri -like "file://*") {
-    try {
-        $resolved_uri = ([System.Uri]$video_uri).LocalPath
-    } catch {
-        $resolved_uri = $video_uri -replace '^file:///', '' -replace '^file://', '' -replace '/', '\'
-    }
+    try { $resolved_uri = ([System.Uri]$video_uri).LocalPath } 
+    catch { $resolved_uri = $video_uri -replace '^file:///', '' -replace '/', '\' }
 }
 
-# --- YouTube URL resolution via yt-dlp (best-effort) ---
-if ($resolved_uri -match "youtube\.com|youtu\.be") {
-    $ytdlp = (Get-Command yt-dlp -ErrorAction SilentlyContinue).Source
-    if ($ytdlp) {
-        Set-Content -Path $status_file -Value "Resolving YouTube URL..."
-        $yt_resolved = & $ytdlp --get-url -f "bestaudio" $resolved_uri 2>$null
-        if ($yt_resolved) { $resolved_uri = $yt_resolved }
-    }
-}
-
-# --- Detect finite vs. live stream via ffprobe ---
 $is_live = $true
 $total_chunks = [int]::MaxValue
 if ($video_uri -match "^http://|^https://|^rtsp://|^rtmp://|^udp://") {
-    # Check if stream has a full duration > 180s (VOD)
     if (Test-Path $ffprobe_exe) {
         $dur_str = & $ffprobe_exe -v error -show_entries format=duration -of csv=p=0 $resolved_uri 2>$null
         $duration = 0
         if ([double]::TryParse($dur_str, [ref]$duration) -and $duration -gt 180) {
             $is_live = $false
-            $total_chunks = [math]::Ceiling($duration / $chunk_seconds)
+            $total_chunks = [math]::Ceiling($duration / 30)
         }
     }
 } elseif (Test-Path $ffprobe_exe) {
@@ -2879,122 +2818,159 @@ if ($video_uri -match "^http://|^https://|^rtsp://|^rtmp://|^udp://") {
     $duration = 0
     if ([double]::TryParse($dur_str, [ref]$duration) -and $duration -gt 0) {
         $is_live = $false
-        $total_chunks = [math]::Ceiling($duration / $chunk_seconds)
+        $total_chunks = [math]::Ceiling($duration / 30)
     }
 }
 
-# --- Main chunked transcription loop ---
-$completed = @{}
-$sequential_index = 0
-
-Set-Content -Path $status_file -Value "Transcribing..."
-
-while ($true) {
-    if (Check-Abort) { exit }
+if ($is_live) {
+    Set-Content -Path $status_file -Value "Transcribing Live Stream..."
+    $chunk_seconds = 12
+    $ffArgs = @("-y", "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "2", "-i", $resolved_uri, "-f", "segment", "-segment_time", "$chunk_seconds", "-c:a", "pcm_s16le", "-ac", "1", "-ar", "16000", "$chunks_dir\chunk_%%05d.wav")
+    $ffProc = Start-Process -FilePath $ffmpeg_exe -ArgumentList $ffArgs -PassThru -WindowStyle Hidden
     
-    # Determine target chunk
-    $target_chunk = -1
-    if ($is_live) {
-        $target_chunk = $sequential_index
-    } else {
-        # Read seek hint from Lua
+    $live_chunk_index = 0
+    
+    while ($true) {
+        if (Check-Abort) {
+            if ($ffProc -and -not $ffProc.HasExited) { Stop-Process -Id $ffProc.Id -Force }
+            exit
+        }
+        if ($ffProc -and $ffProc.HasExited) {
+            Set-Content -Path $status_file -Value "Stream ended."
+            Set-Content -Path $done_flag -Value "DONE"
+            exit
+        }
+        
+        $wavs = @(Get-ChildItem -Path $chunks_dir -Filter "chunk_*.wav" | Sort-Object Name)
+        
+        # Procesăm doar dacă avem cel puțin un fișier terminat și unul în curs de scriere
+        if ($wavs.Count -ge 2) {
+            # Catch-up logic: Dacă procesarea a rămas în urmă, ignoră chunk-urile vechi ca să prinzi Live-ul
+            while ($wavs.Count -gt 2) {
+                Remove-Item $wavs[0].FullName -Force -ErrorAction SilentlyContinue
+                $live_chunk_index++
+                $wavs = @(Get-ChildItem -Path $chunks_dir -Filter "chunk_*.wav" | Sort-Object Name)
+            }
+            
+            $wav_to_process = $wavs[0].FullName
+            
+            $wArgs = @("-m", $model_bin, "-f", $wav_to_process, "-osrt")
+            $lang_str = "%s".Trim()
+            if ($lang_str -ne "") {
+                $wArgs += $lang_str.Split(" ", [System.StringSplitOptions]::RemoveEmptyEntries)
+            }
+            & $whisper_exe @wArgs *>$null
+            
+            $chunk_srt = "$wav_to_process.srt"
+            if (Test-Path $chunk_srt) {
+                $srtLines = Get-Content $chunk_srt
+                $shifted = @()
+                $offset = $live_chunk_index * $chunk_seconds
+                foreach ($srtLine in $srtLines) {
+                    if ($srtLine -match '^(\d{2}):(\d{2}):(\d{2})[,.](\d{3}) --> (\d{2}):(\d{2}):(\d{2})[,.](\d{3})$') {
+                        $st = [int]$Matches[1]*3600 + [int]$Matches[2]*60 + [int]$Matches[3] + [int]$Matches[4]/1000 + $offset
+                        $et = [int]$Matches[5]*3600 + [int]$Matches[6]*60 + [int]$Matches[7] + [int]$Matches[8]/1000 + $offset
+                        $fmtTime = { param($t) $h=[int][math]::Floor($t/3600); $m=[int][math]::Floor(($t%%3600)/60); $s=[int][math]::Floor($t%%60); $ms=[int][math]::Floor(($t%%1)*1000); "{0:D2}:{1:D2}:{2:D2},{3:D3}" -f $h,$m,$s,$ms }
+                        $shifted += "$(& $fmtTime $st) --> $(& $fmtTime $et)"
+                    } else {
+                        $shifted += $srtLine
+                    }
+                }
+                $shifted | Add-Content "$srt_out.live"
+                Remove-Item $chunk_srt -Force -ErrorAction SilentlyContinue
+            }
+            Remove-Item $wav_to_process -Force -ErrorAction SilentlyContinue
+            $live_chunk_index++
+        }
+        Start-Sleep -Seconds 1
+    }
+} else {
+    $chunk_seconds = 30
+    $completed = @{}
+    $sequential_index = 0
+    Set-Content -Path $status_file -Value "Transcribing VOD..."
+    
+    while ($true) {
+        if (Check-Abort) { exit }
+        
+        $target_chunk = -1
         $hint = 0
         $hint_str = Get-Content $seek_hint -ErrorAction SilentlyContinue
         if ($hint_str) { [double]::TryParse($hint_str, [ref]$hint) | Out-Null }
         $current_chunk = [math]::Floor($hint / $chunk_seconds)
         
-        # Find first uncompleted chunk from current position forward (up to 2 ahead)
         for ($i = $current_chunk; $i -le ($current_chunk + 2) -and $i -lt $total_chunks; $i++) {
             if ($i -ge 0 -and -not $completed.ContainsKey($i)) {
                 $target_chunk = $i
                 break
             }
         }
-    }
-    
-    # All nearby chunks done — check if fully done (finite) or idle-wait
-    if ($target_chunk -eq -1) {
-        # Signal chunk ready so Lua can resume if paused (seek-back to completed region)
-        Set-Content -Path $chunk_ready -Value "done"
-        if (-not $is_live -and $completed.Count -ge $total_chunks) {
-            Set-Content -Path $status_file -Value "Done!"
-            Set-Content -Path $done_flag -Value "DONE"
-            break
-        }
-        Start-Sleep -Seconds 1
-        continue
-    }
-    
-    # Skip if already completed
-    if ($completed.ContainsKey($target_chunk)) {
-        if ($is_live) { Start-Sleep -Seconds 1 }
-        continue
-    }
-    
-    # Extract chunk audio via ffmpeg
-    $offset = $target_chunk * $chunk_seconds
-    $chunk_name = "chunk_" + $target_chunk.ToString("D5")
-    $chunk_wav = "$chunks_dir\$chunk_name.wav"
-    
-    if ($is_live) {
-        # Live: no seeking, just record the next N seconds with reconnect flags for network stability
-        $ffArgs = @("-y", "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "2", "-i", $resolved_uri, "-t", $chunk_seconds, "-ac", "1", "-ar", "16000", $chunk_wav)
-    } else {
-        # Finite: seek to offset and extract chunk
-        $ffArgs = @("-y", "-ss", $offset, "-t", $chunk_seconds, "-i", $resolved_uri, "-ac", "1", "-ar", "16000", $chunk_wav)
-    }
-    
-    & $ffmpeg_exe @ffArgs *>$null
-    
-    if (Check-Abort) { exit }
-    if (-not (Test-Path $chunk_wav)) {
-        Start-Sleep -Seconds 2
-        continue
-    }
-    
-    # Transcribe chunk via whisper (no -ot; we shift timestamps in post-processing)
-    $wArgs = @("-m", $model_bin, "-f", $chunk_wav, "-osrt")
-    $lang_str = "%s".Trim()
-    if ($lang_str -ne "") {
-        $wArgs += $lang_str.Split(" ", [System.StringSplitOptions]::RemoveEmptyEntries)
-    }
-    & $whisper_exe @wArgs *>$null
-    
-    if (Check-Abort) { exit }
-    
-    # whisper outputs to chunk_NNNNN.wav.srt with timestamps starting at 0
-    # Shift all timestamps by $offset seconds to align with video timeline
-    $chunk_srt = "$chunk_wav.srt"
-    if (Test-Path $chunk_srt) {
-        $srtLines = Get-Content $chunk_srt
-        $shifted = @()
-        foreach ($srtLine in $srtLines) {
-            if ($srtLine -match '^(\d{2}):(\d{2}):(\d{2})[,.](\d{3}) --> (\d{2}):(\d{2}):(\d{2})[,.](\d{3})$') {
-                $st = [int]$Matches[1]*3600 + [int]$Matches[2]*60 + [int]$Matches[3] + [int]$Matches[4]/1000 + $offset
-                $et = [int]$Matches[5]*3600 + [int]$Matches[6]*60 + [int]$Matches[7] + [int]$Matches[8]/1000 + $offset
-                $fmtTime = { param($t) $h=[int][math]::Floor($t/3600); $m=[int][math]::Floor(($t%%3600)/60); $s=[int][math]::Floor($t%%60); $ms=[int][math]::Floor(($t%%1)*1000); "{0:D2}:{1:D2}:{2:D2},{3:D3}" -f $h,$m,$s,$ms }
-                $shifted += "$(& $fmtTime $st) --> $(& $fmtTime $et)"
-            } else {
-                $shifted += $srtLine
+        
+        if ($target_chunk -eq -1) {
+            Set-Content -Path $chunk_ready -Value "done"
+            if ($completed.Count -ge $total_chunks) {
+                Set-Content -Path $status_file -Value "Done!"
+                Set-Content -Path $done_flag -Value "DONE"
+                break
             }
+            Start-Sleep -Seconds 1
+            continue
         }
-        $shifted | Add-Content "$srt_out.live"
+        
+        if ($completed.ContainsKey($target_chunk)) {
+            Start-Sleep -Seconds 1
+            continue
+        }
+        
+        $offset = $target_chunk * $chunk_seconds
+        $chunk_name = "chunk_" + $target_chunk.ToString("D5")
+        $chunk_wav = "$chunks_dir\$chunk_name.wav"
+        
+        $ffArgs = @("-y", "-ss", $offset, "-t", $chunk_seconds, "-i", $resolved_uri, "-ac", "1", "-ar", "16000", $chunk_wav)
+        & $ffmpeg_exe @ffArgs *>$null
+        
+        if (Check-Abort) { exit }
+        if (-not (Test-Path $chunk_wav)) {
+            Start-Sleep -Seconds 2
+            continue
+        }
+        
+        $wArgs = @("-m", $model_bin, "-f", $chunk_wav, "-osrt")
+        $lang_str = "%s".Trim()
+        if ($lang_str -ne "") {
+            $wArgs += $lang_str.Split(" ", [System.StringSplitOptions]::RemoveEmptyEntries)
+        }
+        & $whisper_exe @wArgs *>$null
+        
+        if (Check-Abort) { exit }
+        
+        $chunk_srt = "$chunk_wav.srt"
+        if (Test-Path $chunk_srt) {
+            $srtLines = Get-Content $chunk_srt
+            $shifted = @()
+            foreach ($srtLine in $srtLines) {
+                if ($srtLine -match '^(\d{2}):(\d{2}):(\d{2})[,.](\d{3}) --> (\d{2}):(\d{2}):(\d{2})[,.](\d{3})$') {
+                    $st = [int]$Matches[1]*3600 + [int]$Matches[2]*60 + [int]$Matches[3] + [int]$Matches[4]/1000 + $offset
+                    $et = [int]$Matches[5]*3600 + [int]$Matches[6]*60 + [int]$Matches[7] + [int]$Matches[8]/1000 + $offset
+                    $fmtTime = { param($t) $h=[int][math]::Floor($t/3600); $m=[int][math]::Floor(($t%%3600)/60); $s=[int][math]::Floor($t%%60); $ms=[int][math]::Floor(($t%%1)*1000); "{0:D2}:{1:D2}:{2:D2},{3:D3}" -f $h,$m,$s,$ms }
+                    $shifted += "$(& $fmtTime $st) --> $(& $fmtTime $et)"
+                } else {
+                    $shifted += $srtLine
+                }
+            }
+            $shifted | Add-Content "$srt_out.live"
+        }
+        
+        Set-Content -Path $chunk_ready -Value $target_chunk
+        $completed[$target_chunk] = $true
+        Add-Content -Path $chunks_done_file -Value $target_chunk
+        Remove-Item $chunk_wav -Force -ErrorAction SilentlyContinue
+        Remove-Item $chunk_srt -Force -ErrorAction SilentlyContinue
+        
+        Set-Content -Path $status_file -Value "Transcribing VOD... ($($completed.Count)/$total_chunks chunks)"
     }
-    
-    # Signal chunk ready (Lua will detect this and resume VLC if paused)
-    Set-Content -Path $chunk_ready -Value $target_chunk
-    
-    # Track completion and cleanup chunk files
-    $completed[$target_chunk] = $true
-    Add-Content -Path $chunks_done_file -Value $target_chunk
-    Remove-Item $chunk_wav -Force -ErrorAction SilentlyContinue
-    Remove-Item $chunk_srt -Force -ErrorAction SilentlyContinue
-    
-    if ($is_live) { $sequential_index++ }
-    
-    Set-Content -Path $status_file -Value "Transcribing... ($($completed.Count) chunks done)"
 }
-]], pid_file, ai_dir, whisper_exe, model_bin, srt_out, done_flag, status_file, video_uri, abort_flag, seek_hint, chunks_done, chunk_ready, chunks_dir, model_name, lang_arg)
+]], pid_file, ai_dir, whisper_exe, model_bin, srt_out, done_flag, status_file, video_uri, abort_flag, seek_hint, chunks_done, chunk_ready, chunks_dir, lang_arg, lang_arg)
 
   f:write(ps_script)
   f:close()
@@ -3196,7 +3172,7 @@ while ($true) {
               end
           end
           
-          -- OSD subtitle display (with file-size cache)
+-- OSD subtitle display (with file-size cache)
           local live_file = srt_out .. ".live"
           local lf_size = 0
           local lf_check = io.open(live_file, "r")
@@ -3205,15 +3181,19 @@ while ($true) {
               lf_size = lf_check:seek()
               lf_check:close()
           end
+          
+          local file_changed = false
           if lf_size ~= last_live_size then
               last_live_size = lf_size
               cached_subs = ai_parse_srt(live_file) or {}
+              file_changed = true
           end
           
           if effective_time then
               local max_end_s = 0
               local last_sub_text = nil
               local found_text = nil
+              
               for _, sub in ipairs(cached_subs) do
                   if sub.end_s and sub.end_s > max_end_s then
                       max_end_s = sub.end_s
@@ -3225,15 +3205,29 @@ while ($true) {
                   end
               end
               
-              -- For live streams: if time is slightly ahead of the latest parsed chunk, show recent subtitle
-              if not found_text and is_live_stream and #cached_subs > 0 then
-                  if effective_time > max_end_s and (effective_time - max_end_s) < 20 then
-                      found_text = last_sub_text
+              -- Pentru Live Stream: Arată instantaneu cel mai nou text dedus
+              if is_live_stream then
+                  if file_changed or not rolling_live_text then
+                      local count = #cached_subs
+                      if count >= 2 then
+                          rolling_live_text = cached_subs[count-1].text .. "\n" .. cached_subs[count].text
+                      elseif count == 1 then
+                          rolling_live_text = cached_subs[1].text
+                      end
+                      live_sub_timeout = os.clock() + 12 -- Ține afișat 12 secunde
+                  end
+                  
+                  if os.clock() < (live_sub_timeout or 0) then
+                      found_text = rolling_live_text
+                  else
+                      found_text = nil
                   end
               end
               
               if found_text then
                   vlc.osd.message(found_text, ai_osd_ch_subs, "bottom", 1000000)
+              else
+                  vlc.osd.message("", ai_osd_ch_subs, "bottom", 1)
               end
           end
       end
@@ -3244,7 +3238,7 @@ while ($true) {
       input_table['ai_start']:set_text("🎙️ Transcribe")
   end
 
-  -- Signal completion (no SRT file produced — OSD-only transcription)
+  -- Signal completion
   if vlc.input.item() then
       vlc.osd.message("AI Transcription Complete!", ai_osd_ch_status, "top-right", 4000000)
   end
