@@ -3013,7 +3013,6 @@ if ($is_live) {
   end
 
   -- OSD Polling Loop
-  local last_status = ""
   local last_known_time = (init_time or 0) / 1000000
   local is_paused_for_chunk = (should_play_after_chunk and not is_live_stream)  -- Start paused only for finite files
   local live_start_clock = os.clock()
