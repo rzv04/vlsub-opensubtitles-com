@@ -2836,10 +2836,9 @@ if ($is_live) {
         
         $wavs = @(Get-ChildItem -Path $chunks_dir -Filter "chunk_*.wav" | Sort-Object Name)
         
-        # Procesăm doar dacă avem cel puțin un fișier terminat și unul în curs de scriere
+        # Only process when we have at least one completed file and one still being written
         if ($wavs.Count -ge 2) {
-            # Catch-up logic: Dacă procesarea a rămas în urmă, ignoră chunk-urile vechi ca să prinzi Live-ul
-            while ($wavs.Count -gt 2) {
+            # Catch-up: if processing falls behind, drop old chunks to stay close to the live stream
                 Remove-Item $wavs[0].FullName -Force -ErrorAction SilentlyContinue
                 $live_chunk_index++
                 $wavs = @(Get-ChildItem -Path $chunks_dir -Filter "chunk_*.wav" | Sort-Object Name)
