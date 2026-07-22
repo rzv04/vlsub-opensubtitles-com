@@ -2626,17 +2626,20 @@ end
 
 function ai_abort_transcription()
   local slash = package.config:sub(1,1)
+  local is_windows = (slash == "\\")
   local ai_dir = openSub.conf.dirPath .. slash .. "vlsub_ai"
   local abort_flag = ai_dir .. slash .. "abort_flag.txt"
   local pid_file = ai_dir .. slash .. "pid.txt"
   local chunks_dir = ai_dir .. slash .. "chunks"
   
-  local pid_f = io.open(pid_file, "r")
-  if pid_f then
-      local pid = pid_f:read("*l")
-      pid_f:close()
-      if pid and pid ~= "" then
-          os.execute('taskkill /F /PID ' .. pid .. ' /T >nul 2>&1')
+  if is_windows then
+      local pid_f = io.open(pid_file, "r")
+      if pid_f then
+          local pid = pid_f:read("*l")
+          pid_f:close()
+          if pid and pid ~= "" then
+              os.execute('taskkill /F /PID ' .. pid .. ' /T >nul 2>&1')
+          end
       end
   end
   local af = io.open(abort_flag, "w")
@@ -2649,7 +2652,9 @@ function ai_abort_transcription()
   os.remove(ai_dir .. slash .. "seek_hint.txt")
   os.remove(ai_dir .. slash .. "chunks_done.txt")
   os.remove(ai_dir .. slash .. "chunk_ready.txt")
-  os.execute('powershell -WindowStyle Hidden -Command "Remove-Item -Recurse -Force \'' .. escape_powershell(chunks_dir) .. '\' -ErrorAction SilentlyContinue"')
+  if is_windows then
+      os.execute('powershell -WindowStyle Hidden -Command "Remove-Item -Recurse -Force \'' .. escape_powershell(chunks_dir) .. '\' -ErrorAction SilentlyContinue"')
+  end
 
   ai_is_running = false
   if input_table and input_table['ai_start'] then
