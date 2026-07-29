@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.0-pre] - 2026-07-29
+
+### Added
+- **AI Dependencies Auto-Download**: The extension now automatically downloads `whisper-cli.exe`, `ffmpeg.exe`, `ffprobe.exe`, and the GGML model (if missing) during the first transcription.
+- **Download Progress UI**: Added real-time download progress tracking to the VLC OSD and extension dialog without freezing the player.
+
+### Fixed
+- **CMD Window Flashing**: Removed annoying command prompt flashes that occurred when the extension was opened or closed.
+- **Extension Hang on Close**: Fixed an issue where the extension dialog would immediately reopen after closing while transcription was active.
+- **Whisper Binary Compatibility**: Updated the script to use `whisper-cli.exe` instead of `main.exe` to support `whisper.cpp` v1.9+ updates and prevent silent transcription failures.
+- **Duration Fallback**: Improved AI chunking logic by falling back to VLC's internal duration when `ffprobe` fails to read network streams.
 ## [1.3.0-beta] - 2026-07-21
 
 ### Added
