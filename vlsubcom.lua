@@ -1718,7 +1718,7 @@ end
 
 
 function close()
-  ai_abort_transcription()
+  vlc.deactivate()
 end
 
 function deactivate()
@@ -2625,6 +2625,11 @@ local function ai_parse_srt(filepath)
 end
 
 function ai_abort_transcription()
+  -- Skip cleanup if no AI transcription was running
+  if not ai_is_running then
+    return
+  end
+
   local slash = package.config:sub(1,1)
   local is_windows = (slash == "\\")
   local ai_dir = openSub.conf.dirPath .. slash .. "vlsub_ai"
@@ -2652,15 +2657,240 @@ function ai_abort_transcription()
   os.remove(ai_dir .. slash .. "seek_hint.txt")
   os.remove(ai_dir .. slash .. "chunks_done.txt")
   os.remove(ai_dir .. slash .. "chunk_ready.txt")
-  if is_windows then
-      os.execute('powershell -WindowStyle Hidden -Command "Remove-Item -Recurse -Force \'' .. escape_powershell(chunks_dir) .. '\' -ErrorAction SilentlyContinue"')
-  end
+  -- Chunks dir cleanup is left for the next transcription session to overwrite
 
   ai_is_running = false
   if input_table and input_table['ai_start'] then
       input_table['ai_start']:set_text("🎙️ Transcribe")
   end
   vlc.msg.dbg("[VLSub] AI Transcription forcefully aborted via cleanup routine.")
+end
+
+-- Auto-download AI dependencies (whisper.cpp, ffmpeg, ffprobe, GGML model)
+-- Returns true if all dependencies are present, false on failure.
+function ai_ensure_dependencies(status_label)
+  local ai_dir = openSub.conf.dirPath .. slash .. "vlsub_ai"
+  local model_name = openSub.option.ai_model or "tiny"
+
+  local whisper_exe = ai_dir .. slash .. "whisper-cli.exe"
+  local ffmpeg_exe = ai_dir .. slash .. "ffmpeg.exe"
+  local ffprobe_exe = ai_dir .. slash .. "ffprobe.exe"
+  local model_bin = ai_dir .. slash .. "ggml-" .. model_name .. ".bin"
+
+  -- Fast path: all deps already exist
+  if ai_file_exists(whisper_exe) and ai_file_exists(ffmpeg_exe)
+     and ai_file_exists(ffprobe_exe) and ai_file_exists(model_bin) then
+    vlc.msg.dbg("[VLSub] AI dependencies already present")
+    return true
+  end
+
+  -- Ensure ai_dir exists
+  if not is_dir(ai_dir) then
+    mkdir_p(ai_dir)
+  end
+
+  if status_label then
+    status_label:set_text("Downloading AI dependencies (one-time setup)...")
+  end
+  vlc.msg.dbg("[VLSub] AI dependencies missing, starting download...")
+
+  local was_playing = (vlc.playlist.status() == "playing")
+  if was_playing then
+    vlc.playlist.pause()
+  end
+
+  local setup_ps1 = ai_dir .. slash .. "ai_setup.ps1"
+  local status_file = ai_dir .. slash .. "ai_status.txt"
+
+  local f = io.open(setup_ps1, "w")
+  if not f then
+    vlc.msg.err("[VLSub] Cannot write AI setup script")
+    return false
+  end
+
+  local ps_setup = string.format([[
+$ErrorActionPreference = "Stop"
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+$ai_dir = "%s"
+$status_file = "%s"
+$model_name = "%s"
+
+$whisper_exe = "$ai_dir\whisper-cli.exe"
+$ffmpeg_exe = "$ai_dir\ffmpeg.exe"
+$ffprobe_exe = "$ai_dir\ffprobe.exe"
+$model_bin = "$ai_dir\ggml-$model_name.bin"
+
+Function Download-WithProgress {
+    param($url, $outFile, $itemName)
+    try {
+        $req = [System.Net.WebRequest]::Create($url)
+        $res = $req.GetResponse()
+        $total = $res.ContentLength
+        $stream = $res.GetResponseStream()
+        $file = [System.IO.File]::Create($outFile)
+        
+        $buffer = New-Object byte[] 131072
+        $read = 0
+        $totalRead = 0
+        $lastUpdate = -1
+        
+        do {
+            $read = $stream.Read($buffer, 0, $buffer.Length)
+            if ($read -gt 0) {
+                $file.Write($buffer, 0, $read)
+                $totalRead += $read
+                
+                if ($total -gt 0) {
+                    $percent = [math]::Floor(($totalRead / $total) * 100)
+                    if ($percent -ge ($lastUpdate + 2)) {
+                        $lastUpdate = $percent
+                        Set-Content -Path $status_file -Value "Downloading $itemName... $percent%%"
+                    }
+                }
+            }
+        } while ($read -gt 0)
+        
+        $file.Close()
+        $stream.Close()
+        $res.Close()
+    } catch {
+        Set-Content -Path $status_file -Value "Error: Failed to download $itemName"
+        exit 1
+    }
+}
+
+try {
+
+# Download whisper.cpp if whisper-cli.exe is missing
+if (-not (Test-Path $whisper_exe)) {
+    Set-Content -Path $status_file -Value "Downloading whisper.cpp..."
+    $whisper_zip = "$ai_dir\whisper-bin-x64.zip"
+    $whisper_url = "https://github.com/ggml-org/whisper.cpp/releases/latest/download/whisper-bin-x64.zip"
+    Download-WithProgress -url $whisper_url -outFile $whisper_zip -itemName "whisper.cpp"
+    Set-Content -Path $status_file -Value "Extracting whisper.cpp..."
+    $whisper_tmp = "$ai_dir\whisper_extract"
+    Expand-Archive -LiteralPath $whisper_zip -DestinationPath $whisper_tmp -Force
+    # Find whisper-cli.exe or main.exe in extracted files
+    $found_exe = Get-ChildItem -Path $whisper_tmp -Recurse -Filter "whisper-cli.exe" | Select-Object -First 1
+    if (-not $found_exe) {
+        $found_exe = Get-ChildItem -Path $whisper_tmp -Recurse -Filter "main.exe" | Select-Object -First 1
+    }
+    if ($found_exe) {
+        Copy-Item -Path $found_exe.FullName -Destination $whisper_exe -Force
+    }
+    # Copy all DLLs needed by whisper
+    Get-ChildItem -Path $whisper_tmp -Recurse -Filter "*.dll" | ForEach-Object {
+        Copy-Item -Path $_.FullName -Destination "$ai_dir\$($_.Name)" -Force
+    }
+    Remove-Item -Recurse -Force $whisper_tmp -ErrorAction SilentlyContinue
+    Remove-Item $whisper_zip -Force -ErrorAction SilentlyContinue
+}
+
+# Download ffmpeg and ffprobe if either is missing
+if (-not (Test-Path $ffmpeg_exe) -or -not (Test-Path $ffprobe_exe)) {
+    Set-Content -Path $status_file -Value "Downloading ffmpeg (this may take a moment)..."
+    $ffmpeg_zip = "$ai_dir\ffmpeg-essentials.zip"
+    $ffmpeg_url = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
+    Download-WithProgress -url $ffmpeg_url -outFile $ffmpeg_zip -itemName "ffmpeg"
+    Set-Content -Path $status_file -Value "Extracting ffmpeg..."
+    $ffmpeg_tmp = "$ai_dir\ffmpeg_extract"
+    Expand-Archive -LiteralPath $ffmpeg_zip -DestinationPath $ffmpeg_tmp -Force
+    # Find ffmpeg.exe and ffprobe.exe in the nested folder structure
+    $found_ffmpeg = Get-ChildItem -Path $ffmpeg_tmp -Recurse -Filter "ffmpeg.exe" | Select-Object -First 1
+    $found_ffprobe = Get-ChildItem -Path $ffmpeg_tmp -Recurse -Filter "ffprobe.exe" | Select-Object -First 1
+    if ($found_ffmpeg) { Copy-Item -Path $found_ffmpeg.FullName -Destination $ffmpeg_exe -Force }
+    if ($found_ffprobe) { Copy-Item -Path $found_ffprobe.FullName -Destination $ffprobe_exe -Force }
+    Remove-Item -Recurse -Force $ffmpeg_tmp -ErrorAction SilentlyContinue
+    Remove-Item $ffmpeg_zip -Force -ErrorAction SilentlyContinue
+}
+
+# Download GGML model if missing
+if (-not (Test-Path $model_bin)) {
+    Set-Content -Path $status_file -Value "Downloading GGML model ($model_name)..."
+    $model_url = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-$model_name.bin"
+    Download-WithProgress -url $model_url -outFile $model_bin -itemName "GGML model"
+}
+
+Set-Content -Path $status_file -Value "Setup complete!"
+
+} catch {
+    Set-Content -Path $status_file -Value "Error: $($_.Exception.Message)"
+    exit 1
+}
+]], escape_cmd_win(ai_dir), escape_cmd_win(status_file), escape_cmd_win(model_name))
+
+  f:write(ps_setup)
+  f:close()
+
+  -- Clear status file before starting
+  local sf_clear = io.open(status_file, "w")
+  if sf_clear then sf_clear:close() end
+
+  -- Run setup asynchronously so we can poll and update OSD without freezing VLC
+  os.execute(string.format('start /b /belownormal powershell -ExecutionPolicy Bypass -WindowStyle Hidden -File "%s"', escape_cmd_win(setup_ps1)))
+
+  local setup_done = false
+  local all_ok = false
+  local setup_osd_ch = vlc.osd.channel_register()
+
+  while not setup_done do
+      -- Safe sleep
+      local sleep_ok = false
+      if vlc.misc and vlc.misc.mdate and vlc.misc.mwait then
+          sleep_ok = pcall(vlc.misc.mwait, vlc.misc.mdate() + 250000)
+      elseif vlc.mdate and vlc.mwait then
+          sleep_ok = pcall(vlc.mwait, vlc.mdate() + 250000)
+      end
+      if not sleep_ok then
+          local s = os.clock()
+          while (os.clock() - s) < 0.25 do
+              if vlc.keep_alive then vlc.keep_alive() end
+          end
+      end
+      if not ai_is_running then break end
+      if vlc.keep_alive then vlc.keep_alive() end
+      if dlg and dlg.update then dlg:update() end
+
+      -- Check status
+      local sf = io.open(status_file, "r")
+      if sf then
+          local s_text = sf:read("*line")
+          sf:close()
+          if s_text and s_text ~= "" then
+              if status_label then status_label:set_text(s_text) end
+              vlc.osd.message("AI Setup: " .. s_text, setup_osd_ch, "center", 1000000)
+              
+              if s_text == "Setup complete!" then
+                  setup_done = true
+                  all_ok = true
+              elseif string.match(s_text, "^Error") then
+                  setup_done = true
+                  all_ok = false
+                  vlc.msg.err("[VLSub] AI setup failed: " .. s_text)
+              end
+          end
+      end
+  end
+  vlc.osd.message("", setup_osd_ch, "center", 1)
+
+  -- Clean up setup script
+  os.remove(setup_ps1)
+
+  -- Verify all files exist
+  local check_ok = ai_file_exists(whisper_exe) and ai_file_exists(ffmpeg_exe)
+    and ai_file_exists(ffprobe_exe) and ai_file_exists(model_bin)
+  if not check_ok then
+    vlc.msg.err("[VLSub] AI setup incomplete - some files still missing")
+    if status_label then
+      status_label:set_text("Error: AI setup incomplete. Check internet connection.")
+    end
+  end
+
+  if was_playing then
+    vlc.playlist.play()
+  end
+
+  return (all_ok and check_ok)
 end
 
 function ai_start_transcription(status_label)
@@ -2684,7 +2914,7 @@ function ai_start_transcription(status_label)
   local ai_dir = openSub.conf.dirPath .. slash .. "vlsub_ai"
 
   local whisper_zip = ai_dir .. slash .. "whisper-bin-x64.zip"
-  local whisper_exe = ai_dir .. slash .. "main.exe"
+  local whisper_exe = ai_dir .. slash .. "whisper-cli.exe"
   local model_bin = ai_dir .. slash .. "ggml-" .. model_name .. ".bin"
   local audio_wav = ai_dir .. slash .. "temp_audio.wav"
   local srt_out = ai_dir .. slash .. "temp_audio.wav.srt"
@@ -2700,7 +2930,14 @@ function ai_start_transcription(status_label)
 
   -- Ensure directory exists before Lua tries to write the ps1 file
   if not is_dir(ai_dir) then
-      local success = os.execute('powershell -WindowStyle Hidden -Command "New-Item -ItemType Directory -Force -Path \'' .. escape_powershell(ai_dir) .. '\'"')
+      mkdir_p(ai_dir)
+  end
+
+  -- Auto-download missing AI dependencies (one-time setup)
+  if not ai_ensure_dependencies(status_label) then
+      status_label:set_text("Status: Error - Failed to download AI dependencies.")
+      ai_is_running = false
+      return
   end
 
   -- Kill any orphaned background processes from a previous crash
@@ -2809,6 +3046,11 @@ if (Test-Path $ffprobe_exe) {
     }
 }
 
+$vlc_duration = %s
+if ($total_chunks -le 0 -and $vlc_duration -gt 0) {
+    $total_chunks = [math]::Ceiling($vlc_duration / 30)
+}
+
 if ($total_chunks -le 0) {
     Set-Content -Path $status_file -Value "Error: invalid media duration."
     Set-Content -Path $done_flag -Value "DONE"
@@ -2899,7 +3141,7 @@ while ($true) {
     
     Set-Content -Path $status_file -Value "Transcribing VOD... ($($completed.Count)/$total_chunks chunks)"
 }
-]], pid_file, ai_dir, whisper_exe, model_bin, srt_out, done_flag, status_file, video_uri, abort_flag, seek_hint, chunks_done, chunk_ready, chunks_dir, lang_arg, lang_arg)
+]], pid_file, ai_dir, whisper_exe, model_bin, srt_out, done_flag, status_file, video_uri, abort_flag, seek_hint, chunks_done, chunk_ready, chunks_dir, tostring(num_dur), lang_arg, lang_arg)
 
   f:write(ps_script)
   f:close()
@@ -3149,7 +3391,7 @@ while ($true) {
   os.remove(seek_hint)
   os.remove(chunks_done)
   os.remove(chunk_ready)
-  os.execute('powershell -WindowStyle Hidden -Command "Remove-Item -Recurse -Force \'' .. escape_powershell(chunks_dir) .. '\' -ErrorAction SilentlyContinue"')
+  -- Chunks dir cleanup is left for the next transcription session to overwrite
 end
 
 function ai_start_transcription_proxy()
